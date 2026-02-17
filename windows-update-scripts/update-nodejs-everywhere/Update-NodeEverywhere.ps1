@@ -168,6 +168,29 @@ function Is-NvmPath {
     return $false
 }
 
+function Get-EmbeddedNodeRecommendation {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $knownEmbeds = @(
+        @{
+            Marker = "\Microsoft Visual Studio\"
+            Recommendation = "Embedded with Visual Studio/Build Tools. Upgrade Visual Studio/Build Tools to update this Node.js copy."
+        },
+        @{
+            Marker = "\dotnet\packs\Microsoft.NET.Runtime.Emscripten"
+            Recommendation = "Embedded with .NET Emscripten packs. Upgrade the installed .NET SDK/runtime packs to update this Node.js copy."
+        }
+    )
+
+    foreach ($embed in $knownEmbeds) {
+        if ($Path.IndexOf($embed.Marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $embed.Recommendation
+        }
+    }
+
+    return $null
+}
+
 # -----------------------------
 # Update routines
 # -----------------------------
@@ -251,14 +274,42 @@ function Update-SystemNode {
         return
     }
 
-    $systemNodeExe = $script:allNodeExe | Where-Object { -not (Is-NvmPath -Path $_) }
-    if (-not $systemNodeExe) {
+    $nonNvmNodeExe = $script:allNodeExe | Where-Object { -not (Is-NvmPath -Path $_) }
+    if (-not $nonNvmNodeExe) {
         Write-Log "Only NVM-based node.exe found; no system install to update."
         return
     }
 
-    Write-Log "Non-NVM node.exe paths detected:"
-    foreach ($p in $systemNodeExe) { Write-Log "  $p" }
+    $embeddedNodeExe = @()
+    $standaloneNodeExe = @()
+
+    foreach ($p in $nonNvmNodeExe) {
+        $recommendation = Get-EmbeddedNodeRecommendation -Path $p
+        if ($recommendation) {
+            $embeddedNodeExe += [pscustomobject]@{
+                Path = $p
+                Recommendation = $recommendation
+            }
+        } else {
+            $standaloneNodeExe += $p
+        }
+    }
+
+    if ($embeddedNodeExe.Count -gt 0) {
+        Write-Log "Known embedded node.exe paths detected:"
+        foreach ($embed in $embeddedNodeExe) {
+            Write-Log "  $($embed.Path)" "WARN"
+            Write-Log "  Recommendation: $($embed.Recommendation)" "WARN"
+        }
+    }
+
+    if (-not $standaloneNodeExe) {
+        Write-Log "No standalone system Node.js installation found. Skipping system Node.js upgrade." "WARN"
+        return
+    }
+
+    Write-Log "Standalone system node.exe paths detected:"
+    foreach ($p in $standaloneNodeExe) { Write-Log "  $p" }
 
     $wingetSucceeded = $false
     $hasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
