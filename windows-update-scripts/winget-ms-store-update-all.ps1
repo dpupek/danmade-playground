@@ -49,7 +49,8 @@ function Normalize-WingetPackageId {
   $candidate = $candidate -replace '^[^A-Za-z0-9]+', ''
 
   # Keep the first token that looks like a winget package identifier.
-  $match = [regex]::Match($candidate, '[A-Za-z0-9][A-Za-z0-9._+-]*(?:\.[A-Za-z0-9][A-Za-z0-9._+-]*)+')
+  # Support both dotted IDs (e.g., Microsoft.Teams) and non-dotted store IDs.
+  $match = [regex]::Match($candidate, '[A-Za-z0-9][A-Za-z0-9._+-]*')
   if ($match.Success) { return $match.Value }
 
   return $candidate
@@ -176,8 +177,8 @@ function Get-WingetUpgradeList {
     $headerIndex = [array]::IndexOf($lines, $header)
     $candidateLines = $lines | Select-Object -Skip ($headerIndex + 2)
     # Some winget rows collapse to single-space separators when columns are full width.
-    # Match a package-id shaped token explicitly and allow 1+ spaces between columns.
-    $rowPattern = '^(?<Name>.+?)\s+(?<Id>[A-Za-z0-9][A-Za-z0-9._+-]*(?:\.[A-Za-z0-9][A-Za-z0-9._+-]*)+)\s+(?<Installed>\S+)\s+(?<Available>\S+)\s+(?<Source>\S+)\s*$'
+    # Accept both dotted and non-dotted package identifiers.
+    $rowPattern = '^(?<Name>.+?)\s+(?<Id>[A-Za-z0-9][A-Za-z0-9._+-]*)\s+(?<Installed>\S+)\s+(?<Available>\S+)\s+(?<Source>\S+)\s*$'
 
     $parsed = foreach ($line in $candidateLines) {
       if ([string]::IsNullOrWhiteSpace($line)) { continue }

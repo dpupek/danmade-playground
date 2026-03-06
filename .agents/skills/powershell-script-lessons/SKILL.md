@@ -1,7 +1,8 @@
-# PowerShell Script Lessons (Winget + Admin Flow)
+---
+name: PowerShell Script Lessons (Winget + Admin Flow)
+description: Use this skill when writing or fixing interactive PowerShell automation that runs external CLI tools (especially `winget`) and needs resilient UX, diagnostics, and elevation flow.
 
-Use this skill when writing or fixing interactive PowerShell automation that runs external CLI tools (especially `winget`) and needs resilient UX, diagnostics, and elevation flow.
-
+---
 ## When To Use
 
 - Interactive update/install scripts with per-item processing.
