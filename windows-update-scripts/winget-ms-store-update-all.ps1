@@ -175,7 +175,9 @@ function Get-WingetUpgradeList {
 
     $headerIndex = [array]::IndexOf($lines, $header)
     $candidateLines = $lines | Select-Object -Skip ($headerIndex + 2)
-    $rowPattern = '^(?<Name>.+?)\s{2,}(?<Id>.+?)\s{2,}(?<Installed>\S+)\s{2,}(?<Available>\S+)\s{2,}(?<Source>\S+)\s*$'
+    # Some winget rows collapse to single-space separators when columns are full width.
+    # Match a package-id shaped token explicitly and allow 1+ spaces between columns.
+    $rowPattern = '^(?<Name>.+?)\s+(?<Id>[A-Za-z0-9][A-Za-z0-9._+-]*(?:\.[A-Za-z0-9][A-Za-z0-9._+-]*)+)\s+(?<Installed>\S+)\s+(?<Available>\S+)\s+(?<Source>\S+)\s*$'
 
     $parsed = foreach ($line in $candidateLines) {
       if ([string]::IsNullOrWhiteSpace($line)) { continue }
