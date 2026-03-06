@@ -38,6 +38,23 @@ function Ensure-WingetMsStoreSource {
   }
 }
 
+function Normalize-WingetPackageId {
+  param([string]$RawId)
+
+  if ([string]::IsNullOrWhiteSpace($RawId)) { return $null }
+
+  $candidate = $RawId.Trim()
+
+  # Strip leading non-identifier artifacts from mojibake/truncated table output.
+  $candidate = $candidate -replace '^[^A-Za-z0-9]+', ''
+
+  # Keep the first token that looks like a winget package identifier.
+  $match = [regex]::Match($candidate, '[A-Za-z0-9][A-Za-z0-9._+-]*(?:\.[A-Za-z0-9][A-Za-z0-9._+-]*)+')
+  if ($match.Success) { return $match.Value }
+
+  return $candidate
+}
+
 function Get-WingetUpgradeList {
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return @() }
 
@@ -92,7 +109,8 @@ function Get-WingetUpgradeList {
       if ($candidate) { $sourceFromNode = $candidate }
     }
 
-    $id = Get-FirstValue -Object $Node -Names @('PackageIdentifier', 'Id')
+    $idRaw = Get-FirstValue -Object $Node -Names @('PackageIdentifier', 'Id')
+    $id = Normalize-WingetPackageId -RawId $idRaw
     if ($id) {
       $name = Get-FirstValue -Object $Node -Names @('PackageName', 'Name')
       if (-not $name) { $name = $id }
@@ -155,14 +173,9 @@ function Get-WingetUpgradeList {
     $header = $lines | Where-Object { $_ -match '^Name\s+Id\s+Version\s+Available\s+Source' } | Select-Object -First 1
     if (-not $header) { return @() }
 
-    $idxId = $header.IndexOf('Id')
-    $idxVersion = $header.IndexOf('Version', $idxId + 2)
-    $idxAvailable = $header.IndexOf('Available', $idxVersion + 7)
-    $idxSource = $header.IndexOf('Source', $idxAvailable + 9)
-    if ($idxId -lt 0 -or $idxVersion -lt 0 -or $idxAvailable -lt 0 -or $idxSource -lt 0) { return @() }
-
     $headerIndex = [array]::IndexOf($lines, $header)
     $candidateLines = $lines | Select-Object -Skip ($headerIndex + 2)
+    $rowPattern = '^(?<Name>.+?)\s{2,}(?<Id>.+?)\s{2,}(?<Installed>\S+)\s{2,}(?<Available>\S+)\s{2,}(?<Source>\S+)\s*$'
 
     $parsed = foreach ($line in $candidateLines) {
       if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -170,12 +183,12 @@ function Get-WingetUpgradeList {
       if ($line -match '^\d+\s+upgrades available\.?$') { continue }
       if ($line -match '^The following packages have an upgrade available') { continue }
 
-      if ($line.Length -lt $idxSource) { continue }
-      $name = $line.Substring(0, $idxId).Trim()
-      $id = $line.Substring($idxId, $idxVersion - $idxId).Trim()
-      $installed = $line.Substring($idxVersion, $idxAvailable - $idxVersion).Trim()
-      $available = $line.Substring($idxAvailable, $idxSource - $idxAvailable).Trim()
-      $source = $line.Substring($idxSource).Trim()
+      if ($line -notmatch $rowPattern) { continue }
+      $name = $matches['Name'].Trim()
+      $id = Normalize-WingetPackageId -RawId $matches['Id']
+      $installed = $matches['Installed'].Trim()
+      $available = $matches['Available'].Trim()
+      $source = $matches['Source'].Trim()
 
       if (-not $id) { continue }
 
