@@ -7,10 +7,12 @@
 
 param(
   [switch]$MachinePhase, # internal flag when relaunching elevated
+  [switch]$NonSilentPhase, # internal flag for elevated reruns without --silent
   [string]$SelectedList  # comma-separated package ids when elevated
 )
 
 $script:InstallerFailures = @()
+$script:CachedUninstallEntries = $null
 
 # Args for single-package upgrade runs. Do not include --all/--recurse (those are for bulk upgrades).
 $WingetCommonArgs = @(
@@ -20,6 +22,148 @@ $WingetCommonArgs = @(
   "--accept-package-agreements",
   "--accept-source-agreements"
 )
+
+function Normalize-DisplayText {
+  param([string]$Text)
+
+  if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+
+  $normalized = $Text.ToLowerInvariant()
+  $normalized = $normalized -replace '\b\d+(?:\.\d+)+(?:[-_]\d+)?\b', ' '
+  $normalized = $normalized -replace '[^a-z0-9]+', ' '
+  $normalized = $normalized -replace '\s+', ' '
+  return $normalized.Trim()
+}
+
+function Get-CachedUninstallEntries {
+  if ($script:CachedUninstallEntries) { return $script:CachedUninstallEntries }
+
+  function Get-OptionalPropertyValue {
+    param(
+      [object]$Object,
+      [string]$Name
+    )
+
+    if (-not $Object) { return $null }
+    $prop = $Object.PSObject.Properties[$Name]
+    if (-not $prop) { return $null }
+    return [string]$prop.Value
+  }
+
+  $paths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )
+
+  $script:CachedUninstallEntries = @(
+    Get-ItemProperty $paths -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.PSObject.Properties['DisplayName'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$_.PSObject.Properties['DisplayName'].Value)
+      } |
+      ForEach-Object {
+        [pscustomobject]@{
+          DisplayName      = Get-OptionalPropertyValue -Object $_ -Name 'DisplayName'
+          DisplayNameNorm  = Normalize-DisplayText -Text (Get-OptionalPropertyValue -Object $_ -Name 'DisplayName')
+          DisplayVersion   = Get-OptionalPropertyValue -Object $_ -Name 'DisplayVersion'
+          InstallLocation  = Get-OptionalPropertyValue -Object $_ -Name 'InstallLocation'
+          UninstallString  = Get-OptionalPropertyValue -Object $_ -Name 'UninstallString'
+          PSPath           = [string]$_.PSPath
+        }
+      }
+  )
+
+  return $script:CachedUninstallEntries
+}
+
+function Get-ScopeFromEntry {
+  param([object]$Entry)
+
+  $psPath = [string]$Entry.PSPath
+  $installLocation = ([string]$Entry.InstallLocation).Trim('"')
+  $uninstallString = ([string]$Entry.UninstallString).Trim('"')
+  $localAppData = [regex]::Escape($env:LOCALAPPDATA)
+  $userProfile = [regex]::Escape($env:USERPROFILE)
+  $programFiles = [regex]::Escape($env:ProgramFiles)
+  $programFilesX86Path = ${env:ProgramFiles(x86)}
+  $programFilesX86 = if ($programFilesX86Path) { [regex]::Escape($programFilesX86Path) } else { $null }
+
+  if ($psPath -match 'HKEY_CURRENT_USER') { return 'User' }
+  if ($psPath -match 'HKEY_LOCAL_MACHINE') { return 'Machine' }
+  if ($installLocation -match "^(?:$localAppData|$userProfile)") { return 'User' }
+  if ($uninstallString -match "^(?:$localAppData|$userProfile)") { return 'User' }
+  if ($installLocation -match "^$programFiles") { return 'Machine' }
+  if ($programFilesX86 -and $installLocation -match "^$programFilesX86") { return 'Machine' }
+  if ($uninstallString -match "^$programFiles") { return 'Machine' }
+  if ($programFilesX86 -and $uninstallString -match "^$programFilesX86") { return 'Machine' }
+
+  return 'Unknown'
+}
+
+function Resolve-PackageInstallMetadata {
+  param([object]$Package)
+
+  if (-not $Package -or [string]::IsNullOrWhiteSpace($Package.Name)) {
+    return [pscustomobject]@{
+      Scope = 'Unknown'
+      Note  = $null
+    }
+  }
+
+  $packageName = [string]$Package.Name
+  $packageNameNorm = Normalize-DisplayText -Text $packageName
+  if (-not $packageNameNorm) {
+    return [pscustomobject]@{
+      Scope = 'Unknown'
+      Note  = $null
+    }
+  }
+
+  $bestMatch = $null
+  $bestScore = -1
+  foreach ($entry in @(Get-CachedUninstallEntries)) {
+    if (-not $entry.DisplayNameNorm) { continue }
+
+    $score = -1
+    if ($entry.DisplayName -eq $packageName) {
+      $score = 140
+    } elseif ($entry.DisplayNameNorm -eq $packageNameNorm) {
+      $score = 120
+    } elseif ($entry.DisplayNameNorm.StartsWith($packageNameNorm)) {
+      $score = 100
+    } elseif ($entry.DisplayNameNorm.Contains($packageNameNorm)) {
+      $score = 90
+    } elseif ($packageNameNorm.Contains($entry.DisplayNameNorm)) {
+      $score = 70
+    }
+
+    if ($score -lt 0) { continue }
+    if ($score -gt $bestScore) {
+      $bestScore = $score
+      $bestMatch = $entry
+    }
+  }
+
+  if (-not $bestMatch) {
+    return [pscustomobject]@{
+      Scope = 'Unknown'
+      Note  = $null
+    }
+  }
+
+  $scope = Get-ScopeFromEntry -Entry $bestMatch
+  $note = switch ($scope) {
+    'User' { 'Per-user install; keep this in the current session.' }
+    'Machine' { 'Machine install; elevated retry can apply.' }
+    default { $null }
+  }
+
+  return [pscustomobject]@{
+    Scope = $scope
+    Note  = $note
+  }
+}
 
 function Ensure-WingetMsStoreSource {
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -158,7 +302,16 @@ function Get-WingetUpgradeList {
               if (-not $pkg.Id) { continue }
               if ($seen.Add($pkg.Id)) { $pkg }
             }
-            if ($deduped) { return $deduped }
+            if ($deduped) {
+              return @(
+                foreach ($pkg in $deduped) {
+                  $metadata = Resolve-PackageInstallMetadata -Package $pkg
+                  $pkg | Add-Member -NotePropertyName InstallScope -NotePropertyValue $metadata.Scope -Force
+                  $pkg | Add-Member -NotePropertyName ScopeNote -NotePropertyValue $metadata.Note -Force
+                  $pkg
+                }
+              )
+            }
           }
         }
       }
@@ -203,7 +356,14 @@ function Get-WingetUpgradeList {
         Source    = $source
       }
     }
-    return $parsed
+    return @(
+      foreach ($pkg in $parsed) {
+        $metadata = Resolve-PackageInstallMetadata -Package $pkg
+        $pkg | Add-Member -NotePropertyName InstallScope -NotePropertyValue $metadata.Scope -Force
+        $pkg | Add-Member -NotePropertyName ScopeNote -NotePropertyValue $metadata.Note -Force
+        $pkg
+      }
+    )
   } catch {
     Write-Warning "winget upgrade listing failed: $($_.Exception.Message)"
     return @()
@@ -212,14 +372,21 @@ function Get-WingetUpgradeList {
 
 function Show-NumberedUpgrades($packages) {
   Write-Host "`n=== Winget upgrade candidates (including unknown versions) ===`n"
+  Write-Host "Note: packages marked [User-scope] should stay in the current session; elevated machine-scope runs do not apply to them.`n" -ForegroundColor DarkYellow
   $i = 1
   foreach ($pkg in $packages) {
     $installed = if ($pkg.Installed) { $pkg.Installed } else { 'unknown' }
     $available = if ($pkg.Available) { $pkg.Available } else { 'unknown' }
+    $scopeTag = switch ($pkg.InstallScope) {
+      'User' { ' [User-scope]' }
+      'Machine' { ' [Machine-scope]' }
+      default { '' }
+    }
     $line = "[{0}] {1} ({2} -> {3}) | Id: {4}{5}" -f `
             $i, $pkg.Name, $installed, $available, $pkg.Id, `
             ($(if ($pkg.Source) { " | Source: $($pkg.Source)" } else { '' }))
-    Write-Host $line
+    if ($pkg.ScopeNote) { $line += " | Note: $($pkg.ScopeNote)" }
+    Write-Host ($line + $scopeTag)
     $i++
   }
 }
@@ -304,10 +471,43 @@ function Get-InstallerExitHint {
 function Get-FailureRetryHint {
   param([object]$Failure)
 
+  if ($Failure.WingetHint) { return $Failure.WingetHint }
+  if ($Failure.Stage -like 'Machine-scope*' -and $Failure.InstallScope -eq 'User') {
+    return "Retry this package in the current session instead of the elevated window."
+  }
   if ($Failure.Stage -eq 'Current session') {
     return "Retry in Elevated window for this package."
   }
   return "Close related apps/processes and retry."
+}
+
+function Get-WingetFailureHint {
+  param(
+    [int]$WingetExitCode,
+    [object]$Package,
+    [string]$Stage,
+    [string]$LogPath
+  )
+
+  switch ($WingetExitCode) {
+    -1978335189 {
+      $diagText = $null
+      if ($LogPath -and (Test-Path $LogPath)) {
+        try { $diagText = Get-Content -Path $LogPath -Raw -ErrorAction Stop } catch { $diagText = $null }
+      }
+
+      if ($diagText -and $diagText -match 'Installer scope does not match currently installed scope:\s*(?<available>\w+)\s*!=\s*(?<installed>\w+)') {
+        $availableScope = $Matches['available']
+        $installedScope = $Matches['installed']
+        return "Installed as $($installedScope.ToLowerInvariant())-scope, but the available winget upgrade only supports $($availableScope.ToLowerInvariant())-scope installs. Winget cannot upgrade this install in place."
+      }
+      if ($Package -and $Package.InstallScope -eq 'User' -and $Stage -like 'Machine-scope*') {
+        return "This package is installed per-user, so the machine-scope run does not apply. Run or retry it in the current session instead."
+      }
+      return "A newer version exists, but winget says it does not apply to this install or to this system's requirements."
+    }
+    default { return $null }
+  }
 }
 
 function Get-InstallerExitCodeFromLog {
@@ -340,7 +540,8 @@ function Get-InstallerExitCodeFromLog {
 function Start-WingetSelected {
   param(
     [object[]]$Packages,
-    [string]$Stage
+    [string]$Stage,
+    [switch]$NonSilent
   )
 
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return }
@@ -353,6 +554,9 @@ function Start-WingetSelected {
     $wingetLogPath = Join-Path -Path $logDir -ChildPath ("{0}-{1}.log" -f $safeId, (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
     $args = @('upgrade','--id',$pkg.Id,'--log',$wingetLogPath) + $WingetCommonArgs
+    if ($NonSilent) {
+      $args = @($args | Where-Object { $_ -ne '--silent' })
+    }
     if ($pkg.Source) { $args += @('--source', $pkg.Source) }
     Write-Host "`n[$Stage] Running: winget $($args -join ' ')"
 
@@ -363,12 +567,15 @@ function Start-WingetSelected {
 
     if ($wingetExitCode -ne 0) {
       $wingetHex = Convert-ToHexCode -Code $wingetExitCode
+      $wingetHint = Get-WingetFailureHint -WingetExitCode $wingetExitCode -Package $pkg -Stage $Stage -LogPath $wingetLogPath
       $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines @()
       $warningText = "winget failed for $($pkg.Id) in $Stage. winget code: $wingetExitCode ($wingetHex)"
       if ($installerExitCode -ne $null) {
         $warningText += "; installer code: $installerExitCode"
       }
-      if ($installerHint) {
+      if ($wingetHint) {
+        $warningText += ". $wingetHint"
+      } elseif ($installerHint) {
         $warningText += ". $installerHint"
       }
       Write-Warning $warningText
@@ -380,8 +587,10 @@ function Start-WingetSelected {
         ExitCodeHex       = $wingetHex
         InstallerExitCode = $installerExitCode
         InstallerHint     = $installerHint
+        WingetHint        = $wingetHint
         RetryHint         = $null
         LogPath           = $wingetLogPath
+        InstallScope      = $pkg.InstallScope
       }
     }
   }
@@ -460,7 +669,10 @@ function Analyze-FailuresWithCodex {
 }
 
 function Start-MachinePhase {
-  param([string[]]$Ids)
+  param(
+    [string[]]$Ids,
+    [switch]$NonSilent
+  )
 
   if (-not $Ids -or $Ids.Count -eq 0) { return }
 
@@ -469,7 +681,12 @@ function Start-MachinePhase {
     '-NoProfile',
     '-ExecutionPolicy','Bypass',
     '-File',"`"$PSCommandPath`"",
-    '-MachinePhase',
+    '-MachinePhase'
+  )
+  if ($NonSilent) {
+    $argList += '-NonSilentPhase'
+  }
+  $argList += @(
     '-SelectedList',"`"$csv`""
   )
 
@@ -489,6 +706,18 @@ function Prompt-RetryFailedInElevated {
     (New-Object System.Management.Automation.Host.ChoiceDescription "&No", "Do not retry now")
   )
   $result = $Host.UI.PromptForChoice("Retry failed upgrades", "Retry failed package upgrades in an elevated window?", $choices, 0)
+  return ($result -eq 0)
+}
+
+function Prompt-RetryFailedNonSilent {
+  param([string]$ScopeDescription = "this window")
+
+  $choices = [System.Management.Automation.Host.ChoiceDescription[]]@(
+    (New-Object System.Management.Automation.Host.ChoiceDescription "&Yes", "Retry failed packages without --silent in $ScopeDescription"),
+    (New-Object System.Management.Automation.Host.ChoiceDescription "&No", "Do not retry now")
+  )
+  $message = "Retry failed package upgrades without --silent? This can surface installer dialogs/prompts that were hidden during the silent run. Target: $ScopeDescription."
+  $result = $Host.UI.PromptForChoice("Retry failed upgrades without --silent", $message, $choices, 0)
   return ($result -eq 0)
 }
 
@@ -531,6 +760,22 @@ try {
       Start-WingetSelected -Packages $selectedPackages -Stage "Current session"
       if ($script:InstallerFailures.Count -gt 0) {
         Summarize-Failures -Failures $script:InstallerFailures
+        $failedPackages = @(
+          foreach ($failure in $script:InstallerFailures) {
+            $selectedPackages | Where-Object { $_.Id -eq $failure.Id } | Select-Object -First 1
+          }
+        ) | Where-Object { $_ } | Select-Object -Unique
+
+        if ($failedPackages.Count -gt 0 -and (Prompt-RetryFailedNonSilent -ScopeDescription "the current session")) {
+          $script:InstallerFailures = @()
+          Start-WingetSelected -Packages $failedPackages -Stage "Current session (non-silent retry)" -NonSilent
+          if ($script:InstallerFailures.Count -gt 0) {
+            Summarize-Failures -Failures $script:InstallerFailures
+          } else {
+            Write-Host "`nNon-silent retry completed successfully."
+          }
+        }
+
         $failedIds = @($script:InstallerFailures | Select-Object -ExpandProperty Id -Unique)
         if ($failedIds.Count -gt 0 -and (Prompt-RetryFailedInElevated)) {
           Start-MachinePhase -Ids $failedIds
@@ -543,8 +788,24 @@ try {
     }
 
     # Relaunch elevated to run the same selection as admin.
-    Start-MachinePhase -Ids ($selectedPackages | Select-Object -ExpandProperty Id)
-    Write-Host "Opening an elevated window to run the selected upgrades..."
+    $userScopedPackages = @($selectedPackages | Where-Object { $_.InstallScope -eq 'User' })
+    $machineScopedPackages = @($selectedPackages | Where-Object { $_.InstallScope -ne 'User' })
+
+    if ($userScopedPackages.Count -gt 0) {
+      $userScopedIds = ($userScopedPackages | Select-Object -ExpandProperty Id) -join ', '
+      Write-Host "Running user-scope packages in the current session: $userScopedIds" -ForegroundColor Yellow
+      Start-WingetSelected -Packages $userScopedPackages -Stage "Current session (user-scope)"
+      if ($script:InstallerFailures.Count -gt 0) {
+        Summarize-Failures -Failures $script:InstallerFailures
+      }
+    }
+
+    if ($machineScopedPackages.Count -gt 0) {
+      Start-MachinePhase -Ids ($machineScopedPackages | Select-Object -ExpandProperty Id)
+      Write-Host "Opening an elevated window to run machine-scope upgrades..."
+    } else {
+      Write-Host "No machine-scope packages remain after filtering out user-scope installs."
+    }
     Exit-WithPause
   }
 
@@ -556,13 +817,31 @@ try {
   }
 
   $machinePackages = foreach ($id in $machineIds) { [pscustomobject]@{ Name = $id; Id = $id; Source = $null } }
-  Start-WingetSelected -Packages $machinePackages -Stage "Machine-scope"
+  $machineStage = if ($NonSilentPhase) { "Machine-scope (non-silent retry)" } else { "Machine-scope" }
+  Start-WingetSelected -Packages $machinePackages -Stage $machineStage -NonSilent:$NonSilentPhase
   if ($script:InstallerFailures.Count -gt 0) {
-    Write-Host "\nMachine-scope completed with failures."
+    Write-Host "`n$machineStage completed with failures."
     Analyze-FailuresWithCodex -Failures $script:InstallerFailures
     Summarize-Failures -Failures $script:InstallerFailures
+
+    if (-not $NonSilentPhase) {
+      $failedIds = @($script:InstallerFailures | Select-Object -ExpandProperty Id -Unique)
+      if ($failedIds.Count -gt 0 -and (Prompt-RetryFailedNonSilent -ScopeDescription "this elevated window")) {
+        $script:InstallerFailures = @()
+        $retryPackages = foreach ($id in $failedIds) { [pscustomobject]@{ Name = $id; Id = $id; Source = $null } }
+        Start-WingetSelected -Packages $retryPackages -Stage "Machine-scope (non-silent retry)" -NonSilent
+
+        if ($script:InstallerFailures.Count -gt 0) {
+          Write-Host "`nMachine-scope non-silent retry still has failures."
+          Analyze-FailuresWithCodex -Failures $script:InstallerFailures
+          Summarize-Failures -Failures $script:InstallerFailures
+        } else {
+          Write-Host "Machine-scope non-silent retry completed successfully."
+        }
+      }
+    }
   } else {
-    Write-Host "Machine-scope upgrades complete."
+    Write-Host "$machineStage upgrades complete."
   }
 
   Exit-WithPause -Prompt "Press Enter to close this elevated window"
