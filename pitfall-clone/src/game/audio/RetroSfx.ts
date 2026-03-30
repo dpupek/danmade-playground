@@ -31,6 +31,15 @@ export class RetroSfx {
     ]);
   }
 
+  humanScream(): void {
+    this.play([
+      { frequency: 540, duration: 0.05, type: "triangle", volume: 0.04 },
+      { frequency: 820, duration: 0.07, type: "sawtooth", volume: 0.045 },
+      { frequency: 680, duration: 0.08, type: "triangle", volume: 0.04 },
+      { frequency: 420, duration: 0.12, type: "sawtooth", volume: 0.03 },
+    ]);
+  }
+
   win(): void {
     this.play([
       { frequency: 520, duration: 0.06, type: "triangle", volume: 0.04 },

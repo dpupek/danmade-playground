@@ -24,7 +24,7 @@ export class EndScene extends Phaser.Scene {
       .text(
         width / 2,
         250,
-        `Score ${data.runState.score}\nRelics ${data.runState.collectedTreasureIds.length}/5\nLives ${data.runState.lives}`,
+        `Score ${data.runState.score}\nClams ${data.runState.collectedTreasureIds.length}/5\nLives ${data.runState.lives}`,
         {
           fontFamily: "Courier New",
           fontSize: "24px",

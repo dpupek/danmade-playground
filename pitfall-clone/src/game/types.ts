@@ -21,7 +21,7 @@ export interface TreasureDefinition {
   label: string;
 }
 
-export type HazardType = "log" | "scorpion";
+export type HazardType = "paul_crab" | "dave_goat" | "mark_wasp";
 
 export interface HazardDefinition {
   id: string;
@@ -33,6 +33,9 @@ export interface HazardDefinition {
   minX: number;
   maxX: number;
   speed?: number;
+  swoopDepth?: number;
+  swoopRate?: number;
+  chargePauseMs?: number;
 }
 
 export interface RoomDefinition {

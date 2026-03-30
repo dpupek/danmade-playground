@@ -20,11 +20,22 @@ type HazardView = {
   config: HazardDefinition;
   sprite: Phaser.GameObjects.Image;
   direction: 1 | -1;
+  originY: number;
+  modeTimer: number;
+  safeMinX: number;
+  safeMaxX: number;
+  isCharging: boolean;
 };
 
 type TreasureView = {
   config: TreasureDefinition;
   sprite: Phaser.GameObjects.Image;
+  sparkles: Phaser.GameObjects.Image[];
+};
+
+type HorizontalSpan = {
+  minX: number;
+  maxX: number;
 };
 
 export class GameScene extends Phaser.Scene {
@@ -41,7 +52,7 @@ export class GameScene extends Phaser.Scene {
   private isClimbing = false;
   private isRespawning = false;
   private currentRoom!: RoomDefinition;
-  private platformViews: Phaser.GameObjects.Rectangle[] = [];
+  private platformViews: Phaser.GameObjects.Container[] = [];
   private ladderViews: Phaser.GameObjects.Graphics[] = [];
   private hazardViews: HazardView[] = [];
   private treasureViews: TreasureView[] = [];
@@ -225,10 +236,9 @@ export class GameScene extends Phaser.Scene {
     const feetY = this.player.y + GAME_CONFIG.player.height / 2;
 
     for (const platform of this.currentRoom.platforms) {
-      const left = platform.x - platform.width / 2;
-      const right = platform.x + platform.width / 2;
-      const top = platform.y - platform.height / 2;
-      const withinX = feetX >= left + 6 && feetX <= right - 6;
+      const span = this.getPlatformSpan(platform, 6);
+      const top = this.getPlatformTop(platform);
+      const withinX = feetX >= span.minX && feetX <= span.maxX;
       const closeToTop = feetY >= top - 4 && feetY <= top + 14;
 
       if (withinX && closeToTop) {
@@ -260,19 +270,87 @@ export class GameScene extends Phaser.Scene {
 
   private moveHazards(dt: number): void {
     this.hazardViews.forEach((hazard) => {
-      const speed = hazard.config.speed ?? GAME_CONFIG.physics.hazardSpeed;
-      hazard.sprite.x += speed * hazard.direction * dt;
-
-      if (hazard.sprite.x >= hazard.config.maxX) {
-        hazard.sprite.x = hazard.config.maxX;
-        hazard.direction = -1;
-        hazard.sprite.setFlipX(true);
-      } else if (hazard.sprite.x <= hazard.config.minX) {
-        hazard.sprite.x = hazard.config.minX;
-        hazard.direction = 1;
-        hazard.sprite.setFlipX(false);
+      switch (hazard.config.type) {
+        case "paul_crab":
+          this.movePaul(hazard, dt);
+          break;
+        case "dave_goat":
+          this.moveDave(hazard, dt);
+          break;
+        case "mark_wasp":
+          this.moveMark(hazard, dt);
+          break;
       }
     });
+  }
+
+  private movePaul(hazard: HazardView, dt: number): void {
+    const speed = hazard.config.speed ?? 120;
+    hazard.sprite.x += speed * hazard.direction * dt;
+
+    if (hazard.sprite.x >= hazard.safeMaxX) {
+      hazard.sprite.x = hazard.safeMaxX;
+      hazard.direction = -1;
+    } else if (hazard.sprite.x <= hazard.safeMinX) {
+      hazard.sprite.x = hazard.safeMinX;
+      hazard.direction = 1;
+    }
+
+    hazard.sprite.setFlipX(hazard.direction < 0);
+  }
+
+  private moveDave(hazard: HazardView, dt: number): void {
+    const pauseMs = hazard.config.chargePauseMs ?? 1000;
+    hazard.modeTimer += dt * 1000;
+
+    if (hazard.modeTimer < pauseMs) {
+      hazard.isCharging = false;
+      hazard.sprite.setTexture("dave-goat");
+      return;
+    }
+
+    if (!hazard.isCharging) {
+      hazard.isCharging = true;
+    }
+
+    hazard.sprite.setTexture("dave-goat-scream");
+    const speed = (hazard.config.speed ?? 90) * 1.65;
+    hazard.sprite.x += speed * hazard.direction * dt;
+
+    if (hazard.sprite.x >= hazard.safeMaxX) {
+      hazard.sprite.x = hazard.safeMaxX;
+      hazard.direction = -1;
+      hazard.modeTimer = 0;
+      hazard.isCharging = false;
+      hazard.sprite.setTexture("dave-goat");
+    } else if (hazard.sprite.x <= hazard.safeMinX) {
+      hazard.sprite.x = hazard.safeMinX;
+      hazard.direction = 1;
+      hazard.modeTimer = 0;
+      hazard.isCharging = false;
+      hazard.sprite.setTexture("dave-goat");
+    }
+
+    hazard.sprite.setFlipX(hazard.direction < 0);
+  }
+
+  private moveMark(hazard: HazardView, dt: number): void {
+    const speed = hazard.config.speed ?? 90;
+    hazard.modeTimer += dt;
+    hazard.sprite.x += speed * hazard.direction * dt;
+
+    if (hazard.sprite.x >= hazard.safeMaxX) {
+      hazard.sprite.x = hazard.safeMaxX;
+      hazard.direction = -1;
+    } else if (hazard.sprite.x <= hazard.safeMinX) {
+      hazard.sprite.x = hazard.safeMinX;
+      hazard.direction = 1;
+    }
+
+    const swoopDepth = hazard.config.swoopDepth ?? 22;
+    const swoopRate = hazard.config.swoopRate ?? 2.5;
+    hazard.sprite.y = hazard.originY + Math.sin(hazard.modeTimer * swoopRate * Math.PI) * swoopDepth;
+    hazard.sprite.setFlipX(hazard.direction < 0);
   }
 
   private collectTreasureOverlaps(): void {
@@ -285,6 +363,10 @@ export class GameScene extends Phaser.Scene {
 
       this.runState = this.controller.collectTreasure(treasure.config.id);
       treasure.sprite.destroy();
+      treasure.sparkles.forEach((sparkle) => {
+        this.tweens.killTweensOf(sparkle);
+        sparkle.destroy();
+      });
       this.treasureViews = this.treasureViews.filter((entry) => entry !== treasure);
       this.sfx.pickup();
       this.refreshHud();
@@ -304,7 +386,7 @@ export class GameScene extends Phaser.Scene {
     const playerBounds = this.getPlayerBounds();
     for (const hazard of this.hazardViews) {
       if (Phaser.Geom.Intersects.RectangleToRectangle(playerBounds, hazard.sprite.getBounds())) {
-        void this.handleDeath();
+        void this.handleDeath(hazard.config.type);
         return;
       }
     }
@@ -318,15 +400,20 @@ export class GameScene extends Phaser.Scene {
     this.platformViews.forEach((view) => view.destroy());
     this.ladderViews.forEach((view) => view.destroy());
     this.hazardViews.forEach((view) => view.sprite.destroy());
-    this.treasureViews.forEach((view) => view.sprite.destroy());
+    this.treasureViews.forEach((view) => {
+      view.sprite.destroy();
+      view.sparkles.forEach((sparkle) => {
+        this.tweens.killTweensOf(sparkle);
+        sparkle.destroy();
+      });
+    });
     this.platformViews = [];
     this.ladderViews = [];
     this.hazardViews = [];
     this.treasureViews = [];
 
     this.currentRoom.platforms.forEach((platform) => {
-      const block = this.add.rectangle(platform.x, platform.y, platform.width, platform.height, 0x5c3d2e);
-      this.platformViews.push(block);
+      this.platformViews.push(this.createPlatformView(platform));
     });
 
     this.currentRoom.ladders.forEach((ladder) => {
@@ -355,13 +442,24 @@ export class GameScene extends Phaser.Scene {
     });
 
     this.currentRoom.hazards.forEach((hazardConfig) => {
-      const texture = hazardConfig.type === "log" ? "log" : "scorpion";
+      const safeBounds = this.resolveHazardTravelBounds(hazardConfig);
+      const texture =
+        hazardConfig.type === "paul_crab"
+          ? "paul-crab"
+          : hazardConfig.type === "dave_goat"
+            ? "dave-goat"
+            : "mark-wasp";
       const sprite = this.add.image(hazardConfig.x, hazardConfig.y, texture);
       sprite.setDisplaySize(hazardConfig.width, hazardConfig.height);
       this.hazardViews.push({
         config: hazardConfig,
         sprite,
         direction: 1,
+        originY: hazardConfig.y,
+        modeTimer: hazardConfig.type === "dave_goat" ? Math.random() * (hazardConfig.chargePauseMs ?? 1000) : 0,
+        safeMinX: safeBounds.minX,
+        safeMaxX: safeBounds.maxX,
+        isCharging: false,
       });
     });
 
@@ -369,8 +467,11 @@ export class GameScene extends Phaser.Scene {
       .filter((treasure) => !this.controller.hasCollected(treasure.id))
       .forEach((treasureConfig) => {
         const sprite = this.add.image(treasureConfig.x, treasureConfig.y, "treasure");
-        sprite.setDisplaySize(20, 20);
-        this.treasureViews.push({ config: treasureConfig, sprite });
+        sprite.setDisplaySize(40, 40);
+        sprite.setDepth(4);
+        sprite.setAlpha(0.98);
+        const sparkles = this.createTreasureSparkles(sprite);
+        this.treasureViews.push({ config: treasureConfig, sprite, sparkles });
       });
 
     const spawn = this.currentRoom.spawn[spawnKey] ?? this.currentRoom.spawn.default;
@@ -401,13 +502,17 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  private async handleDeath(): Promise<void> {
+  private async handleDeath(cause?: HazardDefinition["type"]): Promise<void> {
     if (this.isRespawning || this.runState.status !== "playing") {
       return;
     }
 
     this.isRespawning = true;
-    this.sfx.hurt();
+    if (cause === "dave_goat") {
+      this.sfx.humanScream();
+    } else {
+      this.sfx.hurt();
+    }
     this.player.setTint(0xff0000);
     this.vx = 0;
     this.vy = 0;
@@ -430,7 +535,7 @@ export class GameScene extends Phaser.Scene {
   private refreshHud(): void {
     const seconds = Math.ceil(this.runState.timeRemainingMs / 1000);
     this.hudLabel.setText(
-      `Score ${this.runState.score}   Lives ${this.runState.lives}   Relics ${this.runState.collectedTreasureIds.length}/5   Time ${seconds}`,
+      `Score ${this.runState.score}   Lives ${this.runState.lives}   Clams ${this.runState.collectedTreasureIds.length}/5   Time ${seconds}`,
     );
     this.statusLabel.setText(this.isPaused ? "Paused" : "P pause  R restart");
   }
@@ -441,6 +546,71 @@ export class GameScene extends Phaser.Scene {
     this.player.setFlipX(this.facing < 0);
   }
 
+  private resolveHazardTravelBounds(hazard: HazardDefinition): { minX: number; maxX: number } {
+    const supportingPlatform = this.findHazardPlatform(hazard);
+    if (!supportingPlatform) {
+      return { minX: hazard.minX, maxX: hazard.maxX };
+    }
+
+    const platformSpan = this.getPlatformSpan(supportingPlatform, this.getHazardEdgeInset(hazard));
+    const minX = Math.max(hazard.minX, platformSpan.minX);
+    const maxX = Math.min(hazard.maxX, platformSpan.maxX);
+
+    if (minX <= maxX) {
+      return { minX, maxX };
+    }
+
+    const fallbackX = Phaser.Math.Clamp(hazard.x, platformSpan.minX, platformSpan.maxX);
+    return { minX: fallbackX, maxX: fallbackX };
+  }
+
+  private findHazardPlatform(hazard: HazardDefinition): PlatformDefinition | null {
+    const hazardBottom = hazard.y + hazard.height / 2;
+    const laneCenter = (hazard.minX + hazard.maxX) / 2;
+    const laneWidth = Math.max(hazard.maxX - hazard.minX, hazard.width);
+    let bestPlatform: PlatformDefinition | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const platform of this.currentRoom.platforms) {
+      const span = this.getPlatformSpan(platform);
+      const top = this.getPlatformTop(platform);
+      const overlapsLane = hazard.maxX >= span.minX && hazard.minX <= span.maxX;
+      const nearTop = Math.abs(hazardBottom - top) <= 18;
+
+      if (!overlapsLane || !nearTop) {
+        continue;
+      }
+
+      const platformCenter = (span.minX + span.maxX) / 2;
+      const score = Math.abs(top - hazardBottom) * 8 + Math.abs(platformCenter - laneCenter) + Math.abs(platform.width - laneWidth) * 0.05;
+      if (score < bestScore) {
+        bestPlatform = platform;
+        bestScore = score;
+      }
+    }
+
+    return bestPlatform;
+  }
+
+  private getPlatformSpan(platform: PlatformDefinition, inset = 0): HorizontalSpan {
+    const left = platform.x - platform.width / 2;
+    const right = platform.x + platform.width / 2;
+    const clampedInset = Math.min(inset, platform.width / 2 - 1);
+
+    return {
+      minX: left + clampedInset,
+      maxX: right - clampedInset,
+    };
+  }
+
+  private getPlatformTop(platform: PlatformDefinition): number {
+    return platform.y - platform.height / 2;
+  }
+
+  private getHazardEdgeInset(hazard: HazardDefinition): number {
+    return Math.max(8, hazard.width / 2 - 4);
+  }
+
   private getPlayerBounds(): Phaser.Geom.Rectangle {
     return new Phaser.Geom.Rectangle(
       this.player.x - GAME_CONFIG.player.width / 2,
@@ -448,5 +618,53 @@ export class GameScene extends Phaser.Scene {
       GAME_CONFIG.player.width,
       GAME_CONFIG.player.height,
     );
+  }
+
+  private createPlatformView(platform: PlatformDefinition): Phaser.GameObjects.Container {
+    const textureKey = Phaser.Utils.Array.GetRandom(["wood-plank-a", "wood-plank-b", "wood-plank-c"]);
+    const left = platform.x - platform.width / 2;
+    const top = platform.y - platform.height / 2;
+    const container = this.add.container(left, top);
+    const plank = this.add.tileSprite(platform.width / 2, platform.height / 2, platform.width, platform.height, textureKey);
+    plank.tilePositionX = Phaser.Math.Between(0, 31);
+    const topLip = this.add.rectangle(platform.width / 2, 2, platform.width, 3, 0xd4a373);
+    topLip.setAlpha(0.45);
+    const bottomShadow = this.add.rectangle(platform.width / 2, platform.height - 2, platform.width, 4, 0x3b2418);
+    bottomShadow.setAlpha(0.65);
+
+    container.add([plank, topLip, bottomShadow]);
+    return container;
+  }
+
+  private createTreasureSparkles(sprite: Phaser.GameObjects.Image): Phaser.GameObjects.Image[] {
+    const sparkleConfigs = [
+      { key: "glint-8", offsetX: -18, offsetY: -16, baseScale: 0.9, duration: 260, repeatDelay: 900, angle: 0 },
+      { key: "glint-4", offsetX: 20, offsetY: -6, baseScale: 0.62, duration: 220, repeatDelay: 760, angle: 14 },
+      { key: "glint-4", offsetX: 6, offsetY: 18, baseScale: 0.52, duration: 210, repeatDelay: 1040, angle: -12 },
+    ] as const;
+
+    return sparkleConfigs.map((config, index) => {
+      const sparkle = this.add.image(sprite.x + config.offsetX, sprite.y + config.offsetY, config.key);
+      sparkle.setDepth(6 + index);
+      sparkle.setScale(0.15);
+      sparkle.setAlpha(0);
+      sparkle.setAngle(config.angle);
+
+      this.tweens.add({
+        targets: sparkle,
+        alpha: { from: 0, to: 1 },
+        scaleX: { from: 0.15, to: config.baseScale },
+        scaleY: { from: 0.15, to: config.baseScale },
+        angle: config.angle + (index % 2 === 0 ? 12 : -12),
+        ease: "Sine.easeOut",
+        yoyo: true,
+        repeat: -1,
+        duration: config.duration,
+        repeatDelay: config.repeatDelay,
+        delay: 180 + index * 170,
+      });
+
+      return sparkle;
+    });
   }
 }
