@@ -25,7 +25,7 @@ export interface GameConfig {
 }
 
 export const GAME_CONFIG: GameConfig = {
-  title: "Temple Runaway",
+  title: "Dan's Dungeon",
   world: {
     width: 960,
     height: 540,

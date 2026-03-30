@@ -9,6 +9,18 @@ Temple Runaway is a browser-based Pitfall-style action platformer built with Pha
 3. Start the dev server with `npm run dev`.
 4. Run tests with `npm test`.
 
+## OpenAI Images API
+
+Python 3.12 and the `openai` package are now installed on this machine for higher-quality title art generation.
+
+1. Set `OPENAI_API_KEY` in your shell or user environment.
+2. From `C:\Sandbox\danmade\danmade-playground\pitfall-clone`, run:
+   `python scripts/generate_title_art.py`
+3. The generated bitmap will be written to `output/imagegen/title-box-art-api.png`.
+
+You can also point the script at a custom prompt file:
+`python scripts/generate_title_art.py --prompt-file docs/title-art-prompt.txt --out output/imagegen/title-box-art-v2.png`
+
 ## Controls
 
 - Arrow keys or `WASD`: move and climb

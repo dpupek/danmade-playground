@@ -6,6 +6,10 @@ export class BootScene extends Phaser.Scene {
     super("boot");
   }
 
+  preload(): void {
+    this.load.image("title-box-art", "/images/title-box-art-refined.png");
+  }
+
   create(): void {
     this.createWoodTexture("wood-plank-a", 0);
     this.createWoodTexture("wood-plank-b", 1);
@@ -126,10 +130,15 @@ export class BootScene extends Phaser.Scene {
     const shirt = Phaser.Display.Color.HexStringToColor(GAME_CONFIG.palette.playerShirt).color;
     const feet = Phaser.Display.Color.HexStringToColor(GAME_CONFIG.palette.playerFeet).color;
     const outline = Phaser.Display.Color.HexStringToColor(GAME_CONFIG.palette.shadow).color;
+    const eyeWhite = Phaser.Display.Color.HexStringToColor("#fff7e6").color;
+    const pupil = Phaser.Display.Color.HexStringToColor("#3b2418").color;
+    const mouth = Phaser.Display.Color.HexStringToColor("#b56576").color;
 
     graphics.fillStyle(outline, 1);
     graphics.fillRect(4, 1, 8, 4);
     graphics.fillRect(3, 5, 10, 4);
+    graphics.fillRect(1, 9, 3, 5);
+    graphics.fillRect(12, 9, 3, 5);
     graphics.fillRect(4, 9, 8, 5);
     if (jumping) {
       graphics.fillRect(2, 13, 3, 2);
@@ -147,10 +156,27 @@ export class BootScene extends Phaser.Scene {
 
     graphics.fillStyle(skin, 1);
     graphics.fillRect(5, 4, 6, 4);
+    graphics.fillRect(2, 9, 2, 5);
+    graphics.fillRect(12, 9, 2, 5);
+
+    graphics.fillStyle(eyeWhite, 1);
+    graphics.fillRect(6, 5, 1, 1);
+    graphics.fillRect(9, 5, 1, 1);
+
+    graphics.fillStyle(pupil, 1);
+    graphics.fillRect(6, 5, 1, 1);
+    graphics.fillRect(9, 5, 1, 1);
+    graphics.fillRect(7, 6, 1, 1);
+    graphics.fillRect(7, 7, 2, 1);
+
+    graphics.fillStyle(mouth, 1);
+    graphics.fillRect(7, 8, 2, 1);
 
     graphics.fillStyle(shirt, 1);
     graphics.fillRect(5, 9, 6, 2);
     graphics.fillRect(4, 10, 8, 2);
+    graphics.fillRect(2, 10, 2, 3);
+    graphics.fillRect(12, 10, 2, 3);
 
     graphics.fillStyle(vest, 1);
     graphics.fillRect(4, 11, 3, 3);
