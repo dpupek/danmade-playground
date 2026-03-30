@@ -1,0 +1,5 @@
+
+> pitfall-clone@0.1.0 dev
+> vite --host 127.0.0.1
+
+[2m1:13:46 PM[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m Re-optimizing dependencies because lockfile has changed
