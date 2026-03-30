@@ -42,13 +42,14 @@ export class GameScene extends Phaser.Scene {
   private isRespawning = false;
   private currentRoom!: RoomDefinition;
   private platformViews: Phaser.GameObjects.Rectangle[] = [];
-  private ladderViews: Phaser.GameObjects.Rectangle[] = [];
+  private ladderViews: Phaser.GameObjects.Graphics[] = [];
   private hazardViews: HazardView[] = [];
   private treasureViews: TreasureView[] = [];
   private vx = 0;
   private vy = 0;
   private isGrounded = false;
   private activeLadder: LadderDefinition | null = null;
+  private facing: 1 | -1 = 1;
 
   constructor() {
     super("game");
@@ -63,7 +64,7 @@ export class GameScene extends Phaser.Scene {
     this.createUi();
     this.createInput();
 
-    this.player = this.add.image(0, 0, "player");
+    this.player = this.add.image(0, 0, "player-stand");
     this.player.setDisplaySize(GAME_CONFIG.player.width, GAME_CONFIG.player.height);
     this.player.setDepth(5);
 
@@ -175,10 +176,10 @@ export class GameScene extends Phaser.Scene {
 
       if (moveLeft) {
         this.vx = -GAME_CONFIG.physics.runSpeed;
-        this.player.setFlipX(true);
+        this.facing = -1;
       } else if (moveRight) {
         this.vx = GAME_CONFIG.physics.runSpeed;
-        this.player.setFlipX(false);
+        this.facing = 1;
       } else {
         this.vx = 0;
       }
@@ -202,6 +203,8 @@ export class GameScene extends Phaser.Scene {
       this.isGrounded = false;
       this.sfx.jump();
     }
+
+    this.updatePlayerPose();
   }
 
   private resolvePlatformLanding(): void {
@@ -242,9 +245,9 @@ export class GameScene extends Phaser.Scene {
     for (const ladder of this.currentRoom.ladders) {
       const ladderRect = new Phaser.Geom.Rectangle(
         ladder.x - ladder.width / 2 - 8,
-        ladder.y - ladder.height / 2 - 8,
+        ladder.y - ladder.height / 2 - 20,
         ladder.width + 16,
-        ladder.height + 16,
+        ladder.height + 32,
       );
 
       if (Phaser.Geom.Intersects.RectangleToRectangle(playerBounds, ladderRect)) {
@@ -327,8 +330,27 @@ export class GameScene extends Phaser.Scene {
     });
 
     this.currentRoom.ladders.forEach((ladder) => {
-      const view = this.add.rectangle(ladder.x, ladder.y, ladder.width, ladder.height, 0xd9a441, 0.35);
-      view.setStrokeStyle(2, 0xd9a441);
+      const view = this.add.graphics();
+      const left = ladder.x - ladder.width / 2;
+      const top = ladder.y - ladder.height / 2 - 10;
+      const height = ladder.height + 10;
+      const railWidth = 4;
+      const rungInset = 4;
+      const rungHeight = 2;
+      const rungSpacing = 10;
+
+      view.fillStyle(0x8d5524, 1);
+      view.fillRect(left, top, railWidth, height);
+      view.fillRect(left + ladder.width - railWidth, top, railWidth, height);
+
+      view.fillStyle(0xf6bd60, 1);
+      for (let y = top + 6; y < top + height - 2; y += rungSpacing) {
+        view.fillRect(left + rungInset, y, ladder.width - rungInset * 2, rungHeight);
+      }
+
+      view.lineStyle(1, 0x432818, 1);
+      view.strokeRect(left, top, railWidth, height);
+      view.strokeRect(left + ladder.width - railWidth, top, railWidth, height);
       this.ladderViews.push(view);
     });
 
@@ -359,6 +381,8 @@ export class GameScene extends Phaser.Scene {
     this.isClimbing = false;
     this.isGrounded = false;
     this.activeLadder = null;
+    this.facing = 1;
+    this.updatePlayerPose();
     this.roomLabel.setText(this.currentRoom.title);
     this.refreshHud();
   }
@@ -409,6 +433,12 @@ export class GameScene extends Phaser.Scene {
       `Score ${this.runState.score}   Lives ${this.runState.lives}   Relics ${this.runState.collectedTreasureIds.length}/5   Time ${seconds}`,
     );
     this.statusLabel.setText(this.isPaused ? "Paused" : "P pause  R restart");
+  }
+
+  private updatePlayerPose(): void {
+    const texture = !this.isGrounded && !this.isClimbing ? "player-jump" : "player-stand";
+    this.player.setTexture(texture);
+    this.player.setFlipX(this.facing < 0);
   }
 
   private getPlayerBounds(): Phaser.Geom.Rectangle {
