@@ -372,27 +372,108 @@ function Get-WingetUpgradeList {
 
 function Show-NumberedUpgrades($packages) {
   Write-Host "`n=== Winget upgrade candidates (including unknown versions) ===`n"
-  Write-Host "Note: packages marked [User-scope] should stay in the current session; elevated machine-scope runs do not apply to them.`n" -ForegroundColor DarkYellow
+  $machineCount = @($packages | Where-Object InstallScope -eq 'Machine').Count
+  $userCount = @($packages | Where-Object InstallScope -eq 'User').Count
+  $unknownCount = @($packages | Where-Object { $_.InstallScope -ne 'Machine' -and $_.InstallScope -ne 'User' }).Count
+
+  Write-Host ("{0} package(s): {1} machine, {2} user, {3} unknown`n" -f $packages.Count, $machineCount, $userCount, $unknownCount) -ForegroundColor DarkCyan
+  Write-Host "Note: [User] items stay in the current session; elevated retries only help [Machine] items.`n" -ForegroundColor DarkYellow
+
+  $groupedPackages = @(
+    [pscustomobject]@{ Label = 'Machine-scope updates'; Items = @($packages | Where-Object InstallScope -eq 'Machine') }
+    [pscustomobject]@{ Label = 'User-scope updates'; Items = @($packages | Where-Object InstallScope -eq 'User') }
+    [pscustomobject]@{ Label = 'Other updates'; Items = @($packages | Where-Object { $_.InstallScope -ne 'Machine' -and $_.InstallScope -ne 'User' }) }
+  )
+
+  $indexWidth = [Math]::Max(2, [string]$packages.Count).Length
+  $nameWidth = 34
+  $versionWidth = 14
   $i = 1
-  foreach ($pkg in $packages) {
-    $installed = if ($pkg.Installed) { $pkg.Installed } else { 'unknown' }
-    $available = if ($pkg.Available) { $pkg.Available } else { 'unknown' }
-    $scopeTag = switch ($pkg.InstallScope) {
-      'User' { ' [User-scope]' }
-      'Machine' { ' [Machine-scope]' }
-      default { '' }
+
+  foreach ($group in $groupedPackages) {
+    if (-not $group.Items.Count) { continue }
+
+    Write-Host $group.Label -ForegroundColor Cyan
+    foreach ($pkg in $group.Items) {
+      $installed = if ($pkg.Installed) { [string]$pkg.Installed } else { 'unknown' }
+      $available = if ($pkg.Available) { [string]$pkg.Available } else { 'unknown' }
+      $displayName = [string]$pkg.Name
+      if ($displayName.Length -gt $nameWidth) {
+        $displayName = $displayName.Substring(0, $nameWidth - 3) + '...'
+      }
+
+      $badges = switch ($pkg.InstallScope) {
+        'User' { @('[User]') }
+        'Machine' { @('[Machine]') }
+        default { @('[Unknown]') }
+      }
+      if ($pkg.Source -and $pkg.Source -ne 'winget') { $badges += "[{0}]" -f $pkg.Source }
+
+      $primaryLine = "[{0}] {1} {2} -> {3} {4}" -f `
+        $i.ToString().PadLeft($indexWidth),
+        $displayName.PadRight($nameWidth),
+        $installed.PadRight($versionWidth),
+        $available.PadRight($versionWidth),
+        ($badges -join ' ')
+
+      Write-Host $primaryLine
+
+      $details = @("Id: $($pkg.Id)")
+      if ($pkg.ScopeNote) { $details += "Details: $($pkg.ScopeNote)" }
+      Write-Host ("     " + ($details -join ' | ')) -ForegroundColor DarkGray
+      $i++
     }
-    $line = "[{0}] {1} ({2} -> {3}) | Id: {4}{5}" -f `
-            $i, $pkg.Name, $installed, $available, $pkg.Id, `
-            ($(if ($pkg.Source) { " | Source: $($pkg.Source)" } else { '' }))
-    if ($pkg.ScopeNote) { $line += " | Note: $($pkg.ScopeNote)" }
-    Write-Host ($line + $scopeTag)
-    $i++
+
+    Write-Host ""
   }
 }
 
-function Prompt-Selection([int]$Count) {
-  $input = Read-Host "Enter numbers (e.g., 1,3,5 or 2-4,7) or 'all' to upgrade everything; Enter to skip"
+function Test-OutGridViewAvailable {
+  return [bool](Get-Command Out-GridView -ErrorAction SilentlyContinue)
+}
+
+function Select-UpgradesWithGrid([object[]]$Packages) {
+  Write-Host ""
+  Write-Host "Opening the upgrade picker..." -ForegroundColor Cyan
+  Write-Host "Use Ctrl+Click for nonconsecutive rows, Shift+Click for ranges, and Ctrl+A for all rows. Choose OK to continue." -ForegroundColor DarkYellow
+
+  $rows = @(
+    $index = 1
+    foreach ($pkg in @($Packages)) {
+      [pscustomobject]@{
+        Index      = $index
+        Name       = [string]$pkg.Name
+        Installed  = if ($pkg.Installed) { [string]$pkg.Installed } else { 'unknown' }
+        Available  = if ($pkg.Available) { [string]$pkg.Available } else { 'unknown' }
+        Scope      = if ($pkg.InstallScope) { [string]$pkg.InstallScope } else { 'Unknown' }
+        Elevation  = if ($pkg.InstallScope -eq 'User') { 'Current session only' } else { 'Elevated retry supported' }
+        Source     = if ($pkg.Source) { [string]$pkg.Source } else { '' }
+        Id         = [string]$pkg.Id
+        Note       = if ($pkg.ScopeNote) { [string]$pkg.ScopeNote } else { '' }
+      }
+      $index++
+    }
+  )
+
+  $selectedRows = @(
+    $rows |
+      Out-GridView -Title "Select winget upgrades | Ctrl+Click: multi-select | Shift+Click: range | Ctrl+A: all | OK: continue" -OutputMode Multiple
+  )
+
+  if (-not $selectedRows -or $selectedRows.Count -eq 0) { return @() }
+
+  $selectedPackages = foreach ($row in $selectedRows) {
+    $selectedIndex = [int]$row.Index
+    if ($selectedIndex -ge 1 -and $selectedIndex -le $Packages.Count) {
+      $Packages[$selectedIndex - 1]
+    }
+  }
+
+  return @($selectedPackages | Where-Object { $_ })
+}
+
+function Prompt-SelectionText([int]$Count) {
+  $input = Read-Host "Select packages: 1,3,5 / 2-4 / all / Enter to skip"
   if ([string]::IsNullOrWhiteSpace($input)) { return @() }
 
   $tokens = @()
@@ -429,6 +510,23 @@ function Prompt-Selection([int]$Count) {
   }
 
   return $selected
+}
+
+function Select-Upgrades([object[]]$Packages) {
+  if (Test-OutGridViewAvailable) {
+    return @(Select-UpgradesWithGrid -Packages $Packages)
+  }
+
+  Write-Warning "Out-GridView is not available in this session. Falling back to text selection."
+  Show-NumberedUpgrades -packages $Packages
+  $selectedIndexes = Prompt-SelectionText -Count $Packages.Count
+  if (-not $selectedIndexes -or $selectedIndexes.Count -eq 0) { return @() }
+
+  return @(
+    foreach ($idx in $selectedIndexes) {
+      $Packages[$idx - 1]
+    }
+  )
 }
 
 function Prompt-RunMode {
@@ -737,6 +835,22 @@ function Exit-WithPause {
 $script:RequestedExitCode = 0
 $script:PausePrompt = if ($MachinePhase) { "Press Enter to close this elevated window" } else { "Press Enter to close this window" }
 
+if (-not $PSVersionTable.PSVersion -or $PSVersionTable.PSVersion.Major -lt 7) {
+  $launcherPath = Join-Path -Path $PSScriptRoot -ChildPath 'run-winget-ms-store-update-all.cmd'
+  Write-Host ""
+  Write-Host "This script requires PowerShell 7 or later." -ForegroundColor Yellow
+  Write-Host "Current host: $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)" -ForegroundColor Yellow
+  Write-Host ""
+  if (Test-Path $launcherPath) {
+    Write-Host "Run this launcher instead:" -ForegroundColor Yellow
+    Write-Host "  $launcherPath" -ForegroundColor Cyan
+    Write-Host "It can install the latest PowerShell and then run this script." -ForegroundColor Yellow
+  } else {
+    Write-Host "Install PowerShell 7+ first, then rerun this script with pwsh." -ForegroundColor Yellow
+  }
+  exit 1
+}
+
 try {
   Ensure-WingetMsStoreSource
 
@@ -747,14 +861,11 @@ try {
       Exit-WithPause
     }
 
-    Show-NumberedUpgrades -packages $upgrades
-    $selectedIndexes = Prompt-Selection -Count $upgrades.Count
-    if (-not $selectedIndexes -or $selectedIndexes.Count -eq 0) {
+    $selectedPackages = @(Select-Upgrades -Packages $upgrades)
+    if (-not $selectedPackages -or $selectedPackages.Count -eq 0) {
       Write-Host "No selection made. Exiting without changes."
       Exit-WithPause
     }
-
-    $selectedPackages = foreach ($idx in $selectedIndexes) { $upgrades[$idx - 1] }
     $runMode = Prompt-RunMode
     if ($runMode -eq 0) {
       Start-WingetSelected -Packages $selectedPackages -Stage "Current session"
