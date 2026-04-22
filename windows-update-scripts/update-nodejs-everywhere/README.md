@@ -53,5 +53,6 @@ Update only system install using current (non-LTS) channel:
 ## Notes
 
 - `nvm` must be in `PATH` for NVM update steps.
+- NVM steps are invoked directly in the current console host because `nvm` can reject hidden/background shells with redirected output.
 - `winget` is used when available; otherwise the script downloads the official MSI from `nodejs.org`.
 - Script exits after user presses Enter (pause prompt at the end).

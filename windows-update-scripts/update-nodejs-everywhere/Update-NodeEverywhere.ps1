@@ -102,24 +102,100 @@ function Invoke-CmdText {
     return ($stdout -split "`r?`n")
 }
 
+function Format-CommandText {
+    param(
+        [Parameter(Mandatory)] [string]$FilePath,
+        [string[]]$ArgumentList
+    )
+
+    $parts = @($FilePath) + @($ArgumentList)
+    return ($parts | ForEach-Object {
+        if ($_ -match '\s') { '"{0}"' -f $_ } else { $_ }
+    }) -join ' '
+}
+
 # -----------------------------
 # Node/NVM helpers
 # -----------------------------
+function Invoke-NvmCommand {
+    param([Parameter(Mandatory)] [string[]]$ArgumentList)
+
+    $nvmCommand = Get-Command nvm -CommandType Application -ErrorAction SilentlyContinue
+    if (-not $nvmCommand) {
+        $nvmCommand = Get-Command nvm -ErrorAction Stop
+    }
+
+    $commandText = Format-CommandText -FilePath $nvmCommand.Source -ArgumentList $ArgumentList
+    Write-Log "CMD: $commandText"
+
+    # Run nvm on the current console so it sees a real terminal host.
+    & $nvmCommand.Source @ArgumentList
+    $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+
+    if ($exitCode -ne 0) {
+        throw "Command failed (exit $exitCode): $commandText"
+    }
+}
+
+function Get-NvmRoot {
+    $nvmRoots = @(
+        $env:NVM_HOME,
+        (Join-Path $env:APPDATA "nvm")
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    return $nvmRoots | Select-Object -First 1
+}
+
+function Get-NvmCurrentVersion {
+    $candidatePaths = New-Object System.Collections.Generic.List[string]
+
+    if ($env:NVM_SYMLINK) {
+        $candidatePaths.Add((Join-Path $env:NVM_SYMLINK "node.exe"))
+    }
+
+    $nodeCommand = Get-Command node -CommandType Application -ErrorAction SilentlyContinue
+    if ($nodeCommand -and (Is-NvmPath -Path $nodeCommand.Source)) {
+        $candidatePaths.Add($nodeCommand.Source)
+    }
+
+    foreach ($candidate in ($candidatePaths | Select-Object -Unique)) {
+        if (-not (Test-Path $candidate)) {
+            continue
+        }
+
+        try {
+            $versionText = & $candidate -v 2>$null | Select-Object -First 1
+            if ($LASTEXITCODE -eq 0 -and $versionText -match '^v?([0-9]+\.[0-9]+\.[0-9]+)$') {
+                return $matches[1]
+            }
+        }
+        catch {
+            Write-Log "Unable to read active NVM version from $candidate: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    return $null
+}
+
 function Get-NvmVersions {
-    $lines = Invoke-CmdText -Command "nvm ls"
+    $nvmRoot = Get-NvmRoot
+    if (-not $nvmRoot) {
+        return @()
+    }
+
+    $currentVersionText = Get-NvmCurrentVersion
     $versions = @()
 
-    foreach ($line in $lines) {
-        if ($line -match '^\s*(\*)?\s*([0-9]+\.[0-9]+\.[0-9]+)') {
-            $isCurrent = $matches[1] -eq '*'
-            $verText = $matches[2]
+    foreach ($dir in (Get-ChildItem -Path $nvmRoot -Directory -Force -ErrorAction SilentlyContinue | Sort-Object { [version]$_.Name })) {
+        if ($dir.Name -match '^([0-9]+\.[0-9]+\.[0-9]+)$') {
+            $verText = $matches[1]
             $ver = [version]$verText
 
             $versions += [pscustomobject]@{
                 VersionText = $verText
                 Version     = $ver
                 Major       = $ver.Major
-                IsCurrent   = $isCurrent
+                IsCurrent   = $verText -eq $currentVersionText
             }
         }
     }
@@ -219,7 +295,7 @@ function Update-NvmNode {
 
         Invoke-Step "NVM update major $major from $source" {
             if ($PSCmdlet.ShouldProcess("NVM major $major", $cmd)) {
-                [void](Invoke-CmdText -Command $cmd)
+                Invoke-NvmCommand -ArgumentList @("install", "$major", "--reinstall-packages-from=$source")
             }
         }
     }
@@ -238,7 +314,7 @@ function Update-NvmNode {
             $useCmd = "nvm use $($newCurrent.VersionText)"
             Invoke-Step "Set active NVM version to $($newCurrent.VersionText)" {
                 if ($PSCmdlet.ShouldProcess("Set active Node version", $useCmd)) {
-                    [void](Invoke-CmdText -Command $useCmd)
+                    Invoke-NvmCommand -ArgumentList @("use", $newCurrent.VersionText)
                 }
             }
         }
@@ -256,7 +332,7 @@ function Update-NvmNode {
                 $cmd = "nvm uninstall $($v.VersionText)"
                 Invoke-Step "Remove old NVM version $($v.VersionText)" {
                     if ($PSCmdlet.ShouldProcess("NVM version $($v.VersionText)", $cmd)) {
-                        [void](Invoke-CmdText -Command $cmd)
+                        Invoke-NvmCommand -ArgumentList @("uninstall", $v.VersionText)
                     }
                 }
             }
