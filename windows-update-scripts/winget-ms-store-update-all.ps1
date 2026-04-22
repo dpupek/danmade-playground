@@ -165,6 +165,27 @@ function Resolve-PackageInstallMetadata {
   }
 }
 
+function Compare-VersionText {
+  param(
+    [string]$Left,
+    [string]$Right
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Left) -and [string]::IsNullOrWhiteSpace($Right)) { return 0 }
+  if ([string]::IsNullOrWhiteSpace($Left)) { return -1 }
+  if ([string]::IsNullOrWhiteSpace($Right)) { return 1 }
+
+  $leftVersion = $null
+  $rightVersion = $null
+  $leftParsed = [version]::TryParse($Left, [ref]$leftVersion)
+  $rightParsed = [version]::TryParse($Right, [ref]$rightVersion)
+  if ($leftParsed -and $rightParsed) {
+    return $leftVersion.CompareTo($rightVersion)
+  }
+
+  return [string]::Compare($Left, $Right, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Ensure-WingetMsStoreSource {
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Warning "winget not found."
@@ -308,6 +329,7 @@ function Get-WingetUpgradeList {
                   $metadata = Resolve-PackageInstallMetadata -Package $pkg
                   $pkg | Add-Member -NotePropertyName InstallScope -NotePropertyValue $metadata.Scope -Force
                   $pkg | Add-Member -NotePropertyName ScopeNote -NotePropertyValue $metadata.Note -Force
+                  $pkg | Add-Member -NotePropertyName Provider -NotePropertyValue 'Winget' -Force
                   $pkg
                 }
               )
@@ -361,6 +383,7 @@ function Get-WingetUpgradeList {
         $metadata = Resolve-PackageInstallMetadata -Package $pkg
         $pkg | Add-Member -NotePropertyName InstallScope -NotePropertyValue $metadata.Scope -Force
         $pkg | Add-Member -NotePropertyName ScopeNote -NotePropertyValue $metadata.Note -Force
+        $pkg | Add-Member -NotePropertyName Provider -NotePropertyValue 'Winget' -Force
         $pkg
       }
     )
@@ -370,8 +393,87 @@ function Get-WingetUpgradeList {
   }
 }
 
+function Get-PythonInstallManagerUpgradeList {
+  $py = Get-Command py -ErrorAction SilentlyContinue
+  if (-not $py) { return @() }
+
+  $installedJson = $null
+  try {
+    $installedJson = & $py.Path list --only-managed -f json 2>$null
+  } catch {
+    return @()
+  }
+  if (-not $installedJson) { return @() }
+
+  try {
+    $installedData = ($installedJson -join "`n") | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    Write-Verbose "Python Install Manager JSON parse failed. $_"
+    return @()
+  }
+
+  $installedVersions = @($installedData.versions)
+  if (-not $installedVersions -or $installedVersions.Count -eq 0) { return @() }
+
+  $results = New-Object System.Collections.Generic.List[object]
+  foreach ($runtime in $installedVersions) {
+    $tag = [string]$runtime.tag
+    if ([string]::IsNullOrWhiteSpace($tag)) { continue }
+
+    $installed = [string]$runtime.'sort-version'
+    $displayName = [string]$runtime.'display-name'
+    if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = "Python $tag" }
+
+    $latest = $null
+    try {
+      $onlineJson = & $py.Path list --online -f json $tag 2>$null
+      if ($onlineJson) {
+        $onlineData = ($onlineJson -join "`n") | ConvertFrom-Json -ErrorAction Stop
+        $onlineMatches = @($onlineData.versions | Where-Object { [string]$_.tag -eq $tag })
+        if (-not $onlineMatches -or $onlineMatches.Count -eq 0) {
+          $onlineMatches = @($onlineData.versions)
+        }
+
+        foreach ($candidate in $onlineMatches) {
+          $candidateVersion = [string]$candidate.'sort-version'
+          if ([string]::IsNullOrWhiteSpace($candidateVersion)) { continue }
+          if (-not $latest -or (Compare-VersionText -Left $candidateVersion -Right $latest) -gt 0) {
+            $latest = $candidateVersion
+          }
+        }
+      }
+    } catch {
+      Write-Verbose "Python Install Manager online lookup failed for tag '$tag'. $_"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($latest)) { continue }
+    if ((Compare-VersionText -Left $latest -Right $installed) -le 0) { continue }
+
+    $results.Add([pscustomobject]@{
+      Name       = $displayName
+      Id         = "PythonInstallManager::$tag"
+      Installed  = $installed
+      Available  = $latest
+      Source     = 'python-install-manager'
+      InstallScope = 'User'
+      ScopeNote  = "Managed by Python Install Manager. Updates run via 'py install --update $tag' in this session."
+      Provider   = 'PythonInstallManager'
+      UpdateTag  = $tag
+    })
+  }
+
+  return $results.ToArray()
+}
+
+function Get-UpgradeList {
+  $all = New-Object System.Collections.Generic.List[object]
+  foreach ($pkg in @(Get-WingetUpgradeList)) { $all.Add($pkg) }
+  foreach ($pkg in @(Get-PythonInstallManagerUpgradeList)) { $all.Add($pkg) }
+  return $all.ToArray()
+}
+
 function Show-NumberedUpgrades($packages) {
-  Write-Host "`n=== Winget upgrade candidates (including unknown versions) ===`n"
+  Write-Host "`n=== Available upgrade candidates ===`n"
   $machineCount = @($packages | Where-Object InstallScope -eq 'Machine').Count
   $userCount = @($packages | Where-Object InstallScope -eq 'User').Count
   $unknownCount = @($packages | Where-Object { $_.InstallScope -ne 'Machine' -and $_.InstallScope -ne 'User' }).Count
@@ -418,7 +520,9 @@ function Show-NumberedUpgrades($packages) {
 
       Write-Host $primaryLine
 
-      $details = @("Id: $($pkg.Id)")
+      $provider = if ($pkg.Provider) { [string]$pkg.Provider } else { 'Winget' }
+      $details = @("Provider: $provider", "Id: $($pkg.Id)")
+      if ($pkg.UpdateTag) { $details += "Update tag: $($pkg.UpdateTag)" }
       if ($pkg.ScopeNote) { $details += "Details: $($pkg.ScopeNote)" }
       Write-Host ("     " + ($details -join ' | ')) -ForegroundColor DarkGray
       $i++
@@ -457,7 +561,7 @@ function Select-UpgradesWithGrid([object[]]$Packages) {
 
   $selectedRows = @(
     $rows |
-      Out-GridView -Title "Select winget upgrades | Ctrl+Click: multi-select | Shift+Click: range | Ctrl+A: all | OK: continue" -OutputMode Multiple
+      Out-GridView -Title "Select available upgrades | Ctrl+Click: multi-select | Shift+Click: range | Ctrl+A: all | OK: continue" -OutputMode Multiple
   )
 
   if (-not $selectedRows -or $selectedRows.Count -eq 0) { return @() }
@@ -680,6 +784,7 @@ function Start-WingetSelected {
 
       $script:InstallerFailures += [pscustomobject]@{
         Id                = $pkg.Id
+        Provider          = 'Winget'
         Stage             = $Stage
         ExitCode          = $wingetExitCode
         ExitCodeHex       = $wingetHex
@@ -691,6 +796,68 @@ function Start-WingetSelected {
         InstallScope      = $pkg.InstallScope
       }
     }
+  }
+}
+
+function Start-PythonManagerSelected {
+  param(
+    [object[]]$Packages,
+    [string]$Stage
+  )
+
+  $py = Get-Command py -ErrorAction SilentlyContinue
+  if (-not $py) {
+    Write-Warning "Skipping Python Install Manager upgrades; 'py' command was not found."
+    return
+  }
+
+  foreach ($pkg in @($Packages)) {
+    $tag = [string]$pkg.UpdateTag
+    if ([string]::IsNullOrWhiteSpace($tag)) {
+      Write-Warning "Skipping Python Install Manager entry without update tag: $($pkg.Id)"
+      continue
+    }
+
+    $args = @('install', '--update', '-y', $tag)
+    Write-Host "`n[$Stage] Running: py $($args -join ' ')"
+    & $py.Path @args
+    $pyExitCode = $LASTEXITCODE
+
+    if ($pyExitCode -ne 0) {
+      $pyHex = Convert-ToHexCode -Code $pyExitCode
+      Write-Warning "Python Install Manager failed for $tag in $Stage. exit code: $pyExitCode ($pyHex)"
+      $script:InstallerFailures += [pscustomobject]@{
+        Id                = $pkg.Id
+        Provider          = 'PythonInstallManager'
+        Stage             = $Stage
+        ExitCode          = $pyExitCode
+        ExitCodeHex       = $pyHex
+        InstallerExitCode = $null
+        InstallerHint     = "Python Install Manager update failed for tag '$tag'."
+        WingetHint        = $null
+        RetryHint         = "Retry this package in the current session."
+        LogPath           = $null
+        InstallScope      = 'User'
+      }
+    }
+  }
+}
+
+function Start-SelectedUpgrades {
+  param(
+    [object[]]$Packages,
+    [string]$Stage,
+    [switch]$NonSilent
+  )
+
+  $wingetPackages = @($Packages | Where-Object { -not $_.Provider -or $_.Provider -eq 'Winget' })
+  if ($wingetPackages.Count -gt 0) {
+    Start-WingetSelected -Packages $wingetPackages -Stage $Stage -NonSilent:$NonSilent
+  }
+
+  $pythonPackages = @($Packages | Where-Object { $_.Provider -eq 'PythonInstallManager' })
+  if ($pythonPackages.Count -gt 0) {
+    Start-PythonManagerSelected -Packages $pythonPackages -Stage $Stage
   }
 }
 
@@ -724,7 +891,8 @@ function Summarize-Failures {
     if (-not $fail.RetryHint) { $fail.RetryHint = Get-FailureRetryHint -Failure $fail }
     $reason = Summarize-LogReason -Path $fail.LogPath
     $logNote = if ($fail.LogPath) { "Log: $($fail.LogPath)" } else { "No log path provided" }
-    $codeNote = "winget=$($fail.ExitCode)"
+    $toolName = if ($fail.Provider) { [string]$fail.Provider } else { 'winget' }
+    $codeNote = "$toolName=$($fail.ExitCode)"
     if ($fail.ExitCodeHex) { $codeNote += " ($($fail.ExitCodeHex))" }
     if ($fail.InstallerExitCode -ne $null) { $codeNote += ", installer=$($fail.InstallerExitCode)" }
 
@@ -855,9 +1023,9 @@ try {
   Ensure-WingetMsStoreSource
 
   if (-not $MachinePhase) {
-    $upgrades = Get-WingetUpgradeList
+    $upgrades = Get-UpgradeList
     if (-not $upgrades -or $upgrades.Count -eq 0) {
-      Write-Host "No winget upgrades found."
+      Write-Host "No upgrades found from winget or Python Install Manager."
       Exit-WithPause
     }
 
@@ -868,7 +1036,7 @@ try {
     }
     $runMode = Prompt-RunMode
     if ($runMode -eq 0) {
-      Start-WingetSelected -Packages $selectedPackages -Stage "Current session"
+      Start-SelectedUpgrades -Packages $selectedPackages -Stage "Current session"
       if ($script:InstallerFailures.Count -gt 0) {
         Summarize-Failures -Failures $script:InstallerFailures
         $failedPackages = @(
@@ -879,7 +1047,7 @@ try {
 
         if ($failedPackages.Count -gt 0 -and (Prompt-RetryFailedNonSilent -ScopeDescription "the current session")) {
           $script:InstallerFailures = @()
-          Start-WingetSelected -Packages $failedPackages -Stage "Current session (non-silent retry)" -NonSilent
+          Start-SelectedUpgrades -Packages $failedPackages -Stage "Current session (non-silent retry)" -NonSilent
           if ($script:InstallerFailures.Count -gt 0) {
             Summarize-Failures -Failures $script:InstallerFailures
           } else {
@@ -887,9 +1055,13 @@ try {
           }
         }
 
-        $failedIds = @($script:InstallerFailures | Select-Object -ExpandProperty Id -Unique)
-        if ($failedIds.Count -gt 0 -and (Prompt-RetryFailedInElevated)) {
-          Start-MachinePhase -Ids $failedIds
+        $failedMachineIds = @(
+          $script:InstallerFailures |
+            Where-Object { $_.Provider -eq 'Winget' -and $_.InstallScope -ne 'User' } |
+            Select-Object -ExpandProperty Id -Unique
+        )
+        if ($failedMachineIds.Count -gt 0 -and (Prompt-RetryFailedInElevated)) {
+          Start-MachinePhase -Ids $failedMachineIds
           Write-Host "Opening an elevated window to retry failed upgrades..."
         }
       } else {
@@ -905,7 +1077,7 @@ try {
     if ($userScopedPackages.Count -gt 0) {
       $userScopedIds = ($userScopedPackages | Select-Object -ExpandProperty Id) -join ', '
       Write-Host "Running user-scope packages in the current session: $userScopedIds" -ForegroundColor Yellow
-      Start-WingetSelected -Packages $userScopedPackages -Stage "Current session (user-scope)"
+      Start-SelectedUpgrades -Packages $userScopedPackages -Stage "Current session (user-scope)"
       if ($script:InstallerFailures.Count -gt 0) {
         Summarize-Failures -Failures $script:InstallerFailures
       }
@@ -927,9 +1099,9 @@ try {
     Exit-WithPause
   }
 
-  $machinePackages = foreach ($id in $machineIds) { [pscustomobject]@{ Name = $id; Id = $id; Source = $null } }
+  $machinePackages = foreach ($id in $machineIds) { [pscustomobject]@{ Name = $id; Id = $id; Source = $null; Provider = 'Winget' } }
   $machineStage = if ($NonSilentPhase) { "Machine-scope (non-silent retry)" } else { "Machine-scope" }
-  Start-WingetSelected -Packages $machinePackages -Stage $machineStage -NonSilent:$NonSilentPhase
+  Start-SelectedUpgrades -Packages $machinePackages -Stage $machineStage -NonSilent:$NonSilentPhase
   if ($script:InstallerFailures.Count -gt 0) {
     Write-Host "`n$machineStage completed with failures."
     Analyze-FailuresWithCodex -Failures $script:InstallerFailures
@@ -939,8 +1111,8 @@ try {
       $failedIds = @($script:InstallerFailures | Select-Object -ExpandProperty Id -Unique)
       if ($failedIds.Count -gt 0 -and (Prompt-RetryFailedNonSilent -ScopeDescription "this elevated window")) {
         $script:InstallerFailures = @()
-        $retryPackages = foreach ($id in $failedIds) { [pscustomobject]@{ Name = $id; Id = $id; Source = $null } }
-        Start-WingetSelected -Packages $retryPackages -Stage "Machine-scope (non-silent retry)" -NonSilent
+        $retryPackages = foreach ($id in $failedIds) { [pscustomobject]@{ Name = $id; Id = $id; Source = $null; Provider = 'Winget' } }
+        Start-SelectedUpgrades -Packages $retryPackages -Stage "Machine-scope (non-silent retry)" -NonSilent
 
         if ($script:InstallerFailures.Count -gt 0) {
           Write-Host "`nMachine-scope non-silent retry still has failures."
