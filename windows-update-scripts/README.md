@@ -41,6 +41,34 @@ pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\windows-update-scripts\w
 
 That injects a test-only `Microsoft.PowerShell` entry into the picker so you can verify the deferred helper flow from the main updater.
 
+## Remote winget updater
+
+Use [`winget-ms-store-update-remote.ps1`](/E:/Sandbox/danmade-playground/windows-update-scripts/winget-ms-store-update-remote.ps1) when you need to query or run winget upgrades on another Windows computer over PowerShell remoting.
+
+This remote variant is intentionally separate from the local interactive updater:
+- no `Out-GridView`, `Read-Host`, or local UAC popup flow
+- no end-of-run pause prompt
+- defaults to listing available upgrades unless you explicitly pass `-All` or `-PackageId`
+- returns structured objects so the calling session can filter, export, or review results
+
+Examples:
+
+```powershell
+# List available upgrades on a remote computer
+.\winget-ms-store-update-remote.ps1 -ComputerName SERVER01
+
+# Upgrade all available winget packages on a remote computer
+.\winget-ms-store-update-remote.ps1 -ComputerName SERVER01 -All
+
+# Upgrade specific packages on a remote computer
+.\winget-ms-store-update-remote.ps1 -ComputerName SERVER01 -PackageId Git.Git, Microsoft.PowerShell
+```
+
+Notes:
+- PowerShell remoting/WinRM must already be enabled on the target computer.
+- The remote session must already have enough rights to run `winget`; this script does not try to open a UAC prompt remotely.
+- Some Microsoft Store or per-user installs may still behave differently in a remote admin session than they do in a local interactive desktop session.
+
 ## Validation
 
 After changing [`winget-ms-store-update-all.ps1`](/E:/Sandbox/danmade-playground/windows-update-scripts/winget-ms-store-update-all.ps1), run:
