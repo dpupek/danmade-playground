@@ -8,11 +8,13 @@
 param(
   [switch]$MachinePhase, # internal flag when relaunching elevated
   [switch]$NonSilentPhase, # internal flag for elevated reruns without --silent
-  [string]$SelectedList  # comma-separated package ids when elevated
+  [string]$SelectedList,  # comma-separated package ids when elevated
+  [switch]$TestModeAddPowerShell  # inject Microsoft.PowerShell into the picker to test deferred handling
 )
 
 $script:InstallerFailures = @()
 $script:CachedUninstallEntries = $null
+$script:DeferredPowerShellPackageIds = @('Microsoft.PowerShell')
 
 # Args for single-package upgrade runs. Do not include --all/--recurse (those are for bulk upgrades).
 $WingetCommonArgs = @(
@@ -33,6 +35,28 @@ function Normalize-DisplayText {
   $normalized = $normalized -replace '[^a-z0-9]+', ' '
   $normalized = $normalized -replace '\s+', ' '
   return $normalized.Trim()
+}
+
+function Test-IsDeferredPowerShellPackage {
+  param([object]$Package)
+
+  if (-not $Package) { return $false }
+  if ([string]::IsNullOrWhiteSpace([string]$Package.Id)) { return $false }
+
+  return $script:DeferredPowerShellPackageIds -contains [string]$Package.Id
+}
+
+function Get-TestPowerShellPackage {
+  return [pscustomobject]@{
+    Name         = 'PowerShell 7 (test mode)'
+    Id           = 'Microsoft.PowerShell'
+    Installed    = 'test-mode'
+    Available    = 'test-mode'
+    Source       = 'winget'
+    InstallScope = 'Machine'
+    ScopeNote    = 'Test mode injected this entry so you can exercise the deferred PowerShell helper path even when no real upgrade is currently available.'
+    Provider     = 'Winget'
+  }
 }
 
 function Get-CachedUninstallEntries {
@@ -157,6 +181,15 @@ function Resolve-PackageInstallMetadata {
     'User' { 'Per-user install; keep this in the current session.' }
     'Machine' { 'Machine install; elevated retry can apply.' }
     default { $null }
+  }
+
+  if (Test-IsDeferredPowerShellPackage -Package $Package) {
+    $deferredNote = 'PowerShell 7 updates are deferred into a separate helper after all pwsh.exe sessions close.'
+    if ([string]::IsNullOrWhiteSpace($note)) {
+      $note = $deferredNote
+    } else {
+      $note = "$note $deferredNote"
+    }
   }
 
   return [pscustomobject]@{
@@ -469,6 +502,17 @@ function Get-UpgradeList {
   $all = New-Object System.Collections.Generic.List[object]
   foreach ($pkg in @(Get-WingetUpgradeList)) { $all.Add($pkg) }
   foreach ($pkg in @(Get-PythonInstallManagerUpgradeList)) { $all.Add($pkg) }
+
+  if ($TestModeAddPowerShell) {
+    $hasPowerShell = @($all | Where-Object { $_.Id -eq 'Microsoft.PowerShell' }).Count -gt 0
+    if (-not $hasPowerShell) {
+      $all.Add((Get-TestPowerShellPackage))
+      Write-Host "Test mode: injected Microsoft.PowerShell into the upgrade picker." -ForegroundColor Yellow
+    } else {
+      Write-Host "Test mode: Microsoft.PowerShell is already present in the upgrade picker." -ForegroundColor Yellow
+    }
+  }
+
   return $all.ToArray()
 }
 
@@ -653,6 +697,10 @@ function Get-InstallerExitHint {
     [string[]]$OutputLines
   )
 
+  if ($OutputLines -match '(?i)application is currently running\. exit the application then try again\.?') {
+    return "Installer reports the app is still running. Close it, then check Task Manager for a lingering background process before retrying."
+  }
+
   if (-not $InstallerExitCode.HasValue) { return $null }
 
   switch ($InstallerExitCode.Value) {
@@ -762,15 +810,18 @@ function Start-WingetSelected {
     if ($pkg.Source) { $args += @('--source', $pkg.Source) }
     Write-Host "`n[$Stage] Running: winget $($args -join ' ')"
 
-    & winget @args
+    $wingetOutput = @(& winget @args 2>&1 | Tee-Object -Variable wingetOutputBuffer)
     $wingetExitCode = $LASTEXITCODE
+    if ($wingetOutputBuffer) {
+      $wingetOutput = @($wingetOutputBuffer | ForEach-Object { [string]$_ })
+    }
 
     $installerExitCode = Get-InstallerExitCodeFromLog -Path $wingetLogPath
 
     if ($wingetExitCode -ne 0) {
       $wingetHex = Convert-ToHexCode -Code $wingetExitCode
       $wingetHint = Get-WingetFailureHint -WingetExitCode $wingetExitCode -Package $pkg -Stage $Stage -LogPath $wingetLogPath
-      $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines @()
+      $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines $wingetOutput
       $warningText = "winget failed for $($pkg.Id) in $Stage. winget code: $wingetExitCode ($wingetHex)"
       if ($installerExitCode -ne $null) {
         $warningText += "; installer code: $installerExitCode"
@@ -987,6 +1038,69 @@ function Prompt-RetryFailedNonSilent {
   return ($result -eq 0)
 }
 
+function Show-ActivePwshProcesses {
+  $pwshProcesses = @(Get-Process pwsh -ErrorAction SilentlyContinue | Sort-Object Id)
+  if ($pwshProcesses.Count -eq 0) {
+    Write-Host "No active pwsh.exe processes were detected." -ForegroundColor DarkGray
+    return
+  }
+
+  Write-Host "Active PowerShell 7 processes that can block the update:" -ForegroundColor Yellow
+  foreach ($proc in $pwshProcesses) {
+    $windowTitle = if ([string]::IsNullOrWhiteSpace($proc.MainWindowTitle)) { '(no window title)' } else { $proc.MainWindowTitle.Trim() }
+    $path = $null
+    try { $path = $proc.Path } catch { $path = $null }
+    if ($path) {
+      Write-Host ("- PID {0}: {1} | {2}" -f $proc.Id, $windowTitle, $path)
+    } else {
+      Write-Host ("- PID {0}: {1}" -f $proc.Id, $windowTitle)
+    }
+  }
+}
+
+function Start-DeferredPowerShellUpgradeHelper {
+  param([object[]]$Packages)
+
+  $deferredPackages = @($Packages | Where-Object { Test-IsDeferredPowerShellPackage -Package $_ })
+  if ($deferredPackages.Count -eq 0) { return }
+
+  $helperPath = Join-Path -Path $PSScriptRoot -ChildPath 'deferred-winget-package-upgrade.ps1'
+  if (-not (Test-Path $helperPath)) {
+    Write-Warning "Deferred PowerShell helper script was not found at $helperPath"
+    return
+  }
+
+  $packageIds = @($deferredPackages | Select-Object -ExpandProperty Id -Unique)
+  if ($packageIds.Count -eq 0) { return }
+
+  Write-Host ""
+  Write-Host "PowerShell 7 updates will run in a separate Windows PowerShell helper after all pwsh.exe sessions close." -ForegroundColor Yellow
+  Write-Host "Close any remaining PowerShell 7 terminals and check Task Manager if a pwsh.exe process is lingering." -ForegroundColor Yellow
+  Show-ActivePwshProcesses
+
+  $argList = @(
+    '-NoLogo',
+    '-NoProfile',
+    '-ExecutionPolicy','Bypass',
+    '-File',"`"$helperPath`""
+  )
+  foreach ($packageId in $packageIds) {
+    $argList += @('-PackageId',"`"$packageId`"")
+  }
+
+  $needsElevation = @($deferredPackages | Where-Object { $_.InstallScope -ne 'User' }).Count -gt 0
+  try {
+    if ($needsElevation) {
+      Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList | Out-Null
+    } else {
+      Start-Process -FilePath 'powershell.exe' -ArgumentList $argList | Out-Null
+    }
+    Write-Host "Opened the deferred PowerShell update helper in a separate window." -ForegroundColor Cyan
+  } catch {
+    Write-Warning "Unable to start the deferred PowerShell update helper: $($_.Exception.Message)"
+  }
+}
+
 function Exit-WithPause {
   param(
     [int]$Code = 0,
@@ -1035,15 +1149,25 @@ try {
       Exit-WithPause
     }
     $runMode = Prompt-RunMode
+    $deferredPowerShellPackages = @($selectedPackages | Where-Object { Test-IsDeferredPowerShellPackage -Package $_ })
+    $immediatePackages = @($selectedPackages | Where-Object { -not (Test-IsDeferredPowerShellPackage -Package $_) })
     if ($runMode -eq 0) {
-      Start-SelectedUpgrades -Packages $selectedPackages -Stage "Current session"
+      if ($immediatePackages.Count -gt 0) {
+        Start-SelectedUpgrades -Packages $immediatePackages -Stage "Current session"
+      }
+
       if ($script:InstallerFailures.Count -gt 0) {
         Summarize-Failures -Failures $script:InstallerFailures
+        $failedPackageIds = @(
+          $script:InstallerFailures |
+            Where-Object { $_.Id } |
+            Select-Object -ExpandProperty Id -Unique
+        )
         $failedPackages = @(
-          foreach ($failure in $script:InstallerFailures) {
-            $selectedPackages | Where-Object { $_.Id -eq $failure.Id } | Select-Object -First 1
+          foreach ($failedId in $failedPackageIds) {
+            $immediatePackages | Where-Object { $_.Id -eq $failedId } | Select-Object -First 1
           }
-        ) | Where-Object { $_ } | Select-Object -Unique
+        ) | Where-Object { $_ }
 
         if ($failedPackages.Count -gt 0 -and (Prompt-RetryFailedNonSilent -ScopeDescription "the current session")) {
           $script:InstallerFailures = @()
@@ -1064,15 +1188,23 @@ try {
           Start-MachinePhase -Ids $failedMachineIds
           Write-Host "Opening an elevated window to retry failed upgrades..."
         }
-      } else {
-        Write-Host "`nAll selected upgrades completed successfully."
+      }
+
+      if ($deferredPowerShellPackages.Count -gt 0) {
+        Start-DeferredPowerShellUpgradeHelper -Packages $deferredPowerShellPackages
+      }
+
+      if ($script:InstallerFailures.Count -eq 0 -and $immediatePackages.Count -gt 0) {
+        Write-Host "`nAll immediate upgrades completed successfully."
+      } elseif ($script:InstallerFailures.Count -eq 0 -and $deferredPowerShellPackages.Count -gt 0) {
+        Write-Host "`nDeferred PowerShell update helper queued successfully."
       }
       Exit-WithPause
     }
 
     # Relaunch elevated to run the same selection as admin.
-    $userScopedPackages = @($selectedPackages | Where-Object { $_.InstallScope -eq 'User' })
-    $machineScopedPackages = @($selectedPackages | Where-Object { $_.InstallScope -ne 'User' })
+    $userScopedPackages = @($immediatePackages | Where-Object { $_.InstallScope -eq 'User' })
+    $machineScopedPackages = @($immediatePackages | Where-Object { $_.InstallScope -ne 'User' })
 
     if ($userScopedPackages.Count -gt 0) {
       $userScopedIds = ($userScopedPackages | Select-Object -ExpandProperty Id) -join ', '
@@ -1088,6 +1220,10 @@ try {
       Write-Host "Opening an elevated window to run machine-scope upgrades..."
     } else {
       Write-Host "No machine-scope packages remain after filtering out user-scope installs."
+    }
+
+    if ($deferredPowerShellPackages.Count -gt 0) {
+      Start-DeferredPowerShellUpgradeHelper -Packages $deferredPowerShellPackages
     }
     Exit-WithPause
   }

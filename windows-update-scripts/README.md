@@ -23,6 +23,24 @@ Grid selection tips:
 
 If `Out-GridView` is unavailable in the current session, the script falls back to the text-based numbered picker.
 
+## PowerShell 7 special handling
+
+If `Microsoft.PowerShell` is selected for upgrade, the updater does not try to replace PowerShell 7 from the active `pwsh` session.
+
+Instead, it opens a separate Windows PowerShell helper window that:
+
+- waits for all `pwsh.exe` processes to exit
+- reminds you to close lingering PowerShell 7 terminals and check Task Manager if needed
+- runs the deferred `winget` upgrade after PowerShell 7 is no longer in use
+
+To exercise that path even when no real PowerShell update is currently available, run the main script with:
+
+```powershell
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\windows-update-scripts\winget-ms-store-update-all.ps1 -TestModeAddPowerShell
+```
+
+That injects a test-only `Microsoft.PowerShell` entry into the picker so you can verify the deferred helper flow from the main updater.
+
 ## Validation
 
 After changing [`winget-ms-store-update-all.ps1`](/E:/Sandbox/danmade-playground/windows-update-scripts/winget-ms-store-update-all.ps1), run:
