@@ -14,6 +14,8 @@ param(
 )
 
 $script:InstallerFailures = @()
+$script:FailureHistory = @()
+$script:RestartRequiredPackages = @()
 $script:CachedUninstallEntries = $null
 $script:DeferredPowerShellPackageIds = @('Microsoft.PowerShell')
 
@@ -881,19 +883,25 @@ function Convert-ToHexCode {
 function Get-InstallerExitHint {
   param(
     [Nullable[int]]$InstallerExitCode,
-    [string[]]$OutputLines
+    [string[]]$OutputLines,
+    [string]$DiagnosticText
   )
 
-  if ($OutputLines -match '(?i)application is currently running\. exit the application then try again\.?') {
+  $allText = @()
+  if ($OutputLines) { $allText += @($OutputLines) }
+  if ($DiagnosticText) { $allText += @($DiagnosticText) }
+  $combinedText = ($allText -join "`n")
+
+  if ($combinedText -match '(?i)application is currently running\. exit the application then try again\.?') {
     return "Installer reports the app is still running. Close it, then check Task Manager for a lingering background process before retrying."
   }
 
-  if (-not $InstallerExitCode.HasValue) { return $null }
+  if ($null -eq $InstallerExitCode) { return $null }
 
-  switch ($InstallerExitCode.Value) {
+  switch ([int]$InstallerExitCode) {
     1602 { return "Installer canceled by user." }
     1603 {
-      if ($OutputLines -match '(?i)uninstall failed') {
+      if ($combinedText -match '(?i)uninstall(?:er)? failed') {
         return "MSI 1603 during uninstall/upgrade. Usually caused by locked files, running app/processes, or insufficient privileges."
       }
       return "MSI 1603 (fatal install error). Usually caused by locked files, running app/processes, or insufficient privileges."
@@ -908,6 +916,9 @@ function Get-InstallerExitHint {
 function Get-FailureRetryHint {
   param([object]$Failure)
 
+  if ($Failure.RebootRequired) {
+    return "Restart Windows first, then rerun the updater to confirm whether the new version is already in place."
+  }
   if ($Failure.WingetHint) { return $Failure.WingetHint }
   if ($Failure.Stage -like 'Machine-scope*' -and $Failure.InstallScope -eq 'User') {
     return "Retry this package in the current session instead of the elevated window."
@@ -923,20 +934,42 @@ function Get-WingetFailureHint {
     [int]$WingetExitCode,
     [object]$Package,
     [string]$Stage,
-    [string]$LogPath
+    [string]$LogPath,
+    [object]$DiagnosticContext,
+    [object]$PreviousFailure
   )
 
-  switch ($WingetExitCode) {
-    -1978335189 {
-      $diagText = $null
-      if ($LogPath -and (Test-Path $LogPath)) {
-        try { $diagText = Get-Content -Path $LogPath -Raw -ErrorAction Stop } catch { $diagText = $null }
-      }
+  $diagText = $null
+  if ($DiagnosticContext -and $DiagnosticContext.CliLogText) {
+    $diagText = [string]$DiagnosticContext.CliLogText
+  } elseif ($LogPath -and (Test-Path $LogPath)) {
+    try { $diagText = Get-Content -Path $LogPath -Raw -ErrorAction Stop } catch { $diagText = $null }
+  }
 
+  switch ($WingetExitCode) {
+    -1978335226 {
+      if ($DiagnosticContext -and $DiagnosticContext.InstallerExitCode -eq 3010) {
+        return "Installer completed and requested a restart. Reboot Windows, then rerun the updater to confirm the final version."
+      }
+      return "Winget launched the installer, but the installer did not report a normal success path back to winget."
+    }
+    -1978335184 {
+      if ($DiagnosticContext -and $DiagnosticContext.InstallerExitCode -eq 1603) {
+        return "The uninstall step failed with MSI 1603. Close the app and related processes, then retry non-silent or in an elevated window."
+      }
+      return "The uninstall step failed before winget could complete the upgrade."
+    }
+    -1978335189 {
       if ($diagText -and $diagText -match 'Installer scope does not match currently installed scope:\s*(?<available>\w+)\s*!=\s*(?<installed>\w+)') {
         $availableScope = $Matches['available']
         $installedScope = $Matches['installed']
         return "Installed as $($installedScope.ToLowerInvariant())-scope, but the available winget upgrade only supports $($availableScope.ToLowerInvariant())-scope installs. Winget cannot upgrade this install in place."
+      }
+      if ($PreviousFailure -and $PreviousFailure.RebootRequired) {
+        return "The previous attempt completed into a restart-required state. Reboot Windows, then re-check whether the upgrade is already applied before retrying."
+      }
+      if ($PreviousFailure -and $PreviousFailure.ExitCode -eq -1978335184) {
+        return "The previous attempt failed during uninstall, and winget no longer considers an in-place update applicable. Retry in an elevated window; if it still fails, uninstall and reinstall the package explicitly."
       }
       if ($Package -and $Package.InstallScope -eq 'User' -and $Stage -like 'Machine-scope*') {
         return "This package is installed per-user, so the machine-scope run does not apply. Run or retry it in the current session instead."
@@ -944,6 +977,147 @@ function Get-WingetFailureHint {
       return "A newer version exists, but winget says it does not apply to this install or to this system's requirements."
     }
     default { return $null }
+  }
+}
+
+function Get-WingetCliDiagDirectory {
+  return Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir'
+}
+
+function Get-WingetCliDiagnosticLogPath {
+  param(
+    [string]$InstallerLogPath,
+    [string]$PackageId
+  )
+
+  $diagDir = Get-WingetCliDiagDirectory
+  if (-not (Test-Path $diagDir)) { return $null }
+
+  $escapedInstallerLogPath = if ($InstallerLogPath) { [regex]::Escape($InstallerLogPath) } else { $null }
+  $candidateFiles = @(Get-ChildItem -Path $diagDir -Filter 'WinGet-*.log' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 24)
+
+  if ($escapedInstallerLogPath) {
+    foreach ($file in $candidateFiles) {
+      try {
+        $text = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
+        if ($text -match $escapedInstallerLogPath) {
+          return $file.FullName
+        }
+      } catch {
+        continue
+      }
+    }
+
+    return $null
+  }
+
+  if ($PackageId) {
+    foreach ($file in $candidateFiles) {
+      try {
+        $text = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
+        if ($text -match [regex]::Escape($PackageId)) {
+          return $file.FullName
+        }
+      } catch {
+        continue
+      }
+    }
+  }
+
+  return $null
+}
+
+function Get-WingetDiagnosticContext {
+  param(
+    [string]$InstallerLogPath,
+    [string]$PackageId
+  )
+
+  $cliLogPath = Get-WingetCliDiagnosticLogPath -InstallerLogPath $InstallerLogPath -PackageId $PackageId
+  $cliLogText = $null
+  if ($cliLogPath -and (Test-Path $cliLogPath)) {
+    try { $cliLogText = Get-Content -Path $cliLogPath -Raw -ErrorAction Stop } catch { $cliLogText = $null }
+  }
+
+  $installerExitCode = $null
+  if ($cliLogText) {
+    $patterns = @(
+      'ShellExecute installer failed:\s*(-?\d+)',
+      'MsiExec uninstaller failed:\s*(-?\d+)',
+      'MsiExec installer failed:\s*(-?\d+)'
+    )
+
+    foreach ($pattern in $patterns) {
+      $match = [regex]::Match($cliLogText, $pattern)
+      if (-not $match.Success) { continue }
+      $parsed = 0
+      if ([int]::TryParse($match.Groups[1].Value, [ref]$parsed)) {
+        $installerExitCode = $parsed
+        break
+      }
+    }
+  }
+
+  return [pscustomobject]@{
+    CliLogPath        = $cliLogPath
+    CliLogText        = $cliLogText
+    InstallerExitCode = $installerExitCode
+    RebootRequired    = ($installerExitCode -eq 3010)
+  }
+}
+
+function Get-MostRecentFailureForPackage {
+  param([string]$Id)
+
+  if ([string]::IsNullOrWhiteSpace($Id)) { return $null }
+
+  return @(
+    $script:FailureHistory |
+      Where-Object { $_.Id -eq $Id } |
+      Select-Object -Last 1
+  ) | Select-Object -First 1
+}
+
+function Register-InstallerFailure {
+  param([object]$Failure)
+
+  if (-not $Failure) { return }
+  $script:InstallerFailures += $Failure
+  $script:FailureHistory += $Failure
+}
+
+function Add-RestartRequiredPackage {
+  param(
+    [object]$Package,
+    [string]$Stage,
+    [string]$LogPath,
+    [string]$CliLogPath
+  )
+
+  if (-not $Package -or [string]::IsNullOrWhiteSpace([string]$Package.Id)) { return }
+  if (@($script:RestartRequiredPackages | Where-Object { $_.Id -eq $Package.Id }).Count -gt 0) { return }
+
+  $script:RestartRequiredPackages += [pscustomobject]@{
+    Id           = [string]$Package.Id
+    Name         = [string]$Package.Name
+    Stage        = $Stage
+    LogPath      = $LogPath
+    CliLogPath   = $CliLogPath
+    InstallScope = $Package.InstallScope
+  }
+}
+
+function Show-RestartRequiredSummary {
+  if (-not $script:RestartRequiredPackages -or $script:RestartRequiredPackages.Count -eq 0) { return }
+
+  Write-Host ""
+  Write-Host "Restart required:" -ForegroundColor Yellow
+  foreach ($pkg in @($script:RestartRequiredPackages)) {
+    $logNotes = @()
+    if ($pkg.LogPath) { $logNotes += "Installer log: $($pkg.LogPath)" }
+    if ($pkg.CliLogPath) { $logNotes += "Winget log: $($pkg.CliLogPath)" }
+    $detail = if ($logNotes.Count -gt 0) { " (" + ($logNotes -join ' | ') + ")" } else { "" }
+    Write-Host "- $($pkg.Id): installer requested a restart to finish the upgrade. Reboot Windows, then rerun the updater to confirm the new version.$detail"
   }
 }
 
@@ -997,18 +1171,27 @@ function Start-WingetSelected {
     if ($pkg.Source) { $args += @('--source', $pkg.Source) }
     Write-Host "`n[$Stage] Running: winget $($args -join ' ')"
 
-    $wingetOutput = @(& winget @args 2>&1 | Tee-Object -Variable wingetOutputBuffer)
+    $wingetOutput = @()
+    & winget @args
     $wingetExitCode = $LASTEXITCODE
-    if ($wingetOutputBuffer) {
-      $wingetOutput = @($wingetOutputBuffer | ForEach-Object { [string]$_ })
+
+    $diagnosticContext = Get-WingetDiagnosticContext -InstallerLogPath $wingetLogPath -PackageId $pkg.Id
+    $installerExitCode = Get-InstallerExitCodeFromLog -Path $wingetLogPath
+    if ($installerExitCode -eq $null -and $diagnosticContext -and $diagnosticContext.InstallerExitCode -ne $null) {
+      $installerExitCode = $diagnosticContext.InstallerExitCode
     }
 
-    $installerExitCode = Get-InstallerExitCodeFromLog -Path $wingetLogPath
-
     if ($wingetExitCode -ne 0) {
+      if ($diagnosticContext -and $diagnosticContext.RebootRequired) {
+        Add-RestartRequiredPackage -Package $pkg -Stage $Stage -LogPath $wingetLogPath -CliLogPath $diagnosticContext.CliLogPath
+        Write-Host "[$Stage] $($pkg.Id) completed into a restart-required state. Reboot Windows, then rerun the updater to confirm the final version." -ForegroundColor Yellow
+        continue
+      }
+
       $wingetHex = Convert-ToHexCode -Code $wingetExitCode
-      $wingetHint = Get-WingetFailureHint -WingetExitCode $wingetExitCode -Package $pkg -Stage $Stage -LogPath $wingetLogPath
-      $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines $wingetOutput
+      $previousFailure = Get-MostRecentFailureForPackage -Id $pkg.Id
+      $wingetHint = Get-WingetFailureHint -WingetExitCode $wingetExitCode -Package $pkg -Stage $Stage -LogPath $wingetLogPath -DiagnosticContext $diagnosticContext -PreviousFailure $previousFailure
+      $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines $wingetOutput -DiagnosticText (if ($diagnosticContext) { $diagnosticContext.CliLogText } else { $null })
       $warningText = "winget failed for $($pkg.Id) in $Stage. winget code: $wingetExitCode ($wingetHex)"
       if ($installerExitCode -ne $null) {
         $warningText += "; installer code: $installerExitCode"
@@ -1020,7 +1203,7 @@ function Start-WingetSelected {
       }
       Write-Warning $warningText
 
-      $script:InstallerFailures += [pscustomobject]@{
+      Register-InstallerFailure -Failure ([pscustomobject]@{
         Id                = $pkg.Id
         Provider          = 'Winget'
         Stage             = $Stage
@@ -1032,7 +1215,9 @@ function Start-WingetSelected {
         RetryHint         = $null
         LogPath           = $wingetLogPath
         InstallScope      = $pkg.InstallScope
-      }
+        CliLogPath        = if ($diagnosticContext) { $diagnosticContext.CliLogPath } else { $null }
+        RebootRequired    = $false
+      })
     }
   }
 }
@@ -1064,7 +1249,7 @@ function Start-PythonManagerSelected {
     if ($pyExitCode -ne 0) {
       $pyHex = Convert-ToHexCode -Code $pyExitCode
       Write-Warning "Python Install Manager failed for $tag in $Stage. exit code: $pyExitCode ($pyHex)"
-      $script:InstallerFailures += [pscustomobject]@{
+      Register-InstallerFailure -Failure ([pscustomobject]@{
         Id                = $pkg.Id
         Provider          = 'PythonInstallManager'
         Stage             = $Stage
@@ -1076,7 +1261,9 @@ function Start-PythonManagerSelected {
         RetryHint         = "Retry this package in the current session."
         LogPath           = $null
         InstallScope      = 'User'
-      }
+        CliLogPath        = $null
+        RebootRequired    = $false
+      })
     }
   }
 }
@@ -1126,17 +1313,15 @@ function Start-WingetPortableUninstallSelected {
     if ($pkg.Source) { $args += @('--source', $pkg.Source) }
     Write-Host "`n[$Stage] Running: winget $($args -join ' ')"
 
-    $wingetOutput = @(& winget @args 2>&1 | Tee-Object -Variable wingetOutputBuffer)
+    $wingetOutput = @()
+    & winget @args
     $wingetExitCode = $LASTEXITCODE
-    if ($wingetOutputBuffer) {
-      $wingetOutput = @($wingetOutputBuffer | ForEach-Object { [string]$_ })
-    }
 
     $installerExitCode = Get-InstallerExitCodeFromLog -Path $wingetLogPath
 
     if ($wingetExitCode -ne 0) {
       $wingetHex = Convert-ToHexCode -Code $wingetExitCode
-      $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines $wingetOutput
+      $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines $wingetOutput -DiagnosticText $null
       $warningText = "winget cleanup failed for $($pkg.ProductCode) in $Stage. winget code: $wingetExitCode ($wingetHex)"
       if ($installerExitCode -ne $null) {
         $warningText += "; installer code: $installerExitCode"
@@ -1146,7 +1331,7 @@ function Start-WingetPortableUninstallSelected {
       }
       Write-Warning $warningText
 
-      $script:InstallerFailures += [pscustomobject]@{
+      Register-InstallerFailure -Failure ([pscustomobject]@{
         Id                = $pkg.ProductCode
         Provider          = 'WingetPortableCleanup'
         Stage             = $Stage
@@ -1158,7 +1343,9 @@ function Start-WingetPortableUninstallSelected {
         RetryHint         = $null
         LogPath           = $wingetLogPath
         InstallScope      = $pkg.InstallScope
-      }
+        CliLogPath        = $null
+        RebootRequired    = $false
+      })
     }
   }
 }
@@ -1192,7 +1379,10 @@ function Summarize-Failures {
   foreach ($fail in $Failures) {
     if (-not $fail.RetryHint) { $fail.RetryHint = Get-FailureRetryHint -Failure $fail }
     $reason = Summarize-LogReason -Path $fail.LogPath
-    $logNote = if ($fail.LogPath) { "Log: $($fail.LogPath)" } else { "No log path provided" }
+    $logParts = @()
+    if ($fail.LogPath) { $logParts += "Installer log: $($fail.LogPath)" }
+    if ($fail.CliLogPath) { $logParts += "Winget log: $($fail.CliLogPath)" }
+    $logNote = if ($logParts.Count -gt 0) { $logParts -join " | " } else { "No log path provided" }
     $toolName = if ($fail.Provider) { [string]$fail.Provider } else { 'winget' }
     $codeNote = "$toolName=$($fail.ExitCode)"
     if ($fail.ExitCodeHex) { $codeNote += " ($($fail.ExitCodeHex))" }
@@ -1507,6 +1697,8 @@ try {
         Start-DeferredPowerShellUpgradeHelper -Packages $deferredPowerShellPackages
       }
 
+      Show-RestartRequiredSummary
+
       if ($script:InstallerFailures.Count -eq 0 -and $immediatePackages.Count -gt 0) {
         Write-Host "`nAll immediate upgrades completed successfully."
       } elseif ($script:InstallerFailures.Count -eq 0 -and $deferredPowerShellPackages.Count -gt 0) {
@@ -1538,6 +1730,7 @@ try {
     if ($deferredPowerShellPackages.Count -gt 0) {
       Start-DeferredPowerShellUpgradeHelper -Packages $deferredPowerShellPackages
     }
+    Show-RestartRequiredSummary
     Exit-WithPause
   }
 
@@ -1590,6 +1783,8 @@ try {
   } else {
     Write-Host "$machineStage upgrades complete."
   }
+
+  Show-RestartRequiredSummary
 
   Exit-WithPause -Prompt "Press Enter to close this elevated window"
 } catch [System.OperationCanceledException] {

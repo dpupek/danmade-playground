@@ -40,6 +40,7 @@ If you redirect output to files and replay it, progress bars print as many lines
 
 - For clean in-place progress, invoke CLI directly: `& winget @args`.
 - Capture diagnostics with tool-native logging (`winget --log <path>`) instead of stream redirection.
+- Do not pipe the normal interactive `winget` run through `Tee-Object` or other PowerShell pipeline stages when the operator needs the native progress bar or spinner.
 
 ### 4) Better Error Messages
 
@@ -48,6 +49,9 @@ Store and report:
 - Tool exit code in decimal and hex (HRESULT-like values).
 - Installer exit code (e.g., MSI `1603`) parsed from log file.
 - Human-readable hint and concrete retry suggestion.
+- When the wrapper log does not contain the real cause, correlate to winget's own CLI diagnostic log under `AppData\Local\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir`.
+- Prefer exact correlation using the command's `--log` path before reading CLI diagnostic text; do not guess from a package-id-only match if an exact log-path match is missing.
+- Treat installer exit `3010` as restart-required state, not a normal hard failure that should automatically enter the retry ladder.
 
 ### 5) Elevation Fidelity
 
@@ -112,6 +116,8 @@ exit $script:RequestedExitCode
 - `-split '\s{2,}'` table parsing when columns may contain spaces.
 - `[System.Collections.IEnumerable]` parameters for user selections without array normalization.
 - `Start-Process ... -RedirectStandardOutput` for tools with animated progress output.
+- `2>&1 | Tee-Object` around the normal interactive `winget` execution path when native progress is part of the intended UX.
+- Falling back to the newest winget CLI diag log that mentions a package id when the exact command log path cannot be matched; this can bind retries to stale failure evidence.
 - Hardcoded `Start-Process "PowerShell" -Verb RunAs`.
 - Multiple `exit` points that bypass user pause.
 
@@ -121,5 +127,7 @@ exit $script:RequestedExitCode
 - Single package selection works.
 - Multiple package selection works.
 - Failed package summary includes actionable guidance.
+- Restart-required results (for example installer `3010`) are reported as reboot-needed rather than generic failures.
+- Diagnostic correlation prefers exact command/log matches and does not reuse stale retry logs.
 - Retry-elevated prompt appears when failures occur.
 - Final pause appears for success, failure, skip, and unexpected error paths.
