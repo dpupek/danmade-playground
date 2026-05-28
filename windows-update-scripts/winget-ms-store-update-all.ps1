@@ -9,7 +9,8 @@ param(
   [switch]$MachinePhase, # internal flag when relaunching elevated
   [switch]$NonSilentPhase, # internal flag for elevated reruns without --silent
   [string]$SelectedList,  # comma-separated package ids when elevated
-  [switch]$TestModeAddPowerShell  # inject Microsoft.PowerShell into the picker to test deferred handling
+  [switch]$TestModeAddPowerShell,  # inject Microsoft.PowerShell into the picker to test deferred handling
+  [switch]$CleanupPortablePackages # select installed winget portable packages to uninstall with --purge
 )
 
 $script:InstallerFailures = @()
@@ -87,12 +88,23 @@ function Get-CachedUninstallEntries {
         -not [string]::IsNullOrWhiteSpace([string]$_.PSObject.Properties['DisplayName'].Value)
       } |
       ForEach-Object {
+        $productCode = $null
+        if ($_.PSChildName) {
+          $productCode = [string]$_.PSChildName
+        } elseif ($_.PSPath) {
+          $productCode = [string]$_.PSPath
+          if ($productCode -match '\\([^\\]+)$') {
+            $productCode = $Matches[1]
+          }
+        }
+
         [pscustomobject]@{
           DisplayName      = Get-OptionalPropertyValue -Object $_ -Name 'DisplayName'
           DisplayNameNorm  = Normalize-DisplayText -Text (Get-OptionalPropertyValue -Object $_ -Name 'DisplayName')
           DisplayVersion   = Get-OptionalPropertyValue -Object $_ -Name 'DisplayVersion'
           InstallLocation  = Get-OptionalPropertyValue -Object $_ -Name 'InstallLocation'
           UninstallString  = Get-OptionalPropertyValue -Object $_ -Name 'UninstallString'
+          ProductCode      = $productCode
           PSPath           = [string]$_.PSPath
         }
       }
@@ -516,6 +528,67 @@ function Get-UpgradeList {
   return $all.ToArray()
 }
 
+function Test-IsWingetPortablePackageEntry {
+  param([object]$Entry)
+
+  if (-not $Entry) { return $false }
+  if ([string]::IsNullOrWhiteSpace([string]$Entry.ProductCode)) { return $false }
+  if ([string]::IsNullOrWhiteSpace([string]$Entry.UninstallString)) { return $false }
+  if ([string]::IsNullOrWhiteSpace([string]$Entry.InstallLocation)) { return $false }
+
+  $installLocation = ([string]$Entry.InstallLocation).Trim('"')
+  $localPackagesRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+  $programFilesWindowsApps = if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'WindowsApps' } else { $null }
+  $portableRoots = @($localPackagesRoot)
+  if ($programFilesWindowsApps) {
+    $portableRoots += $programFilesWindowsApps
+  }
+
+  $underPortableRoot = $false
+  foreach ($root in @($portableRoots | Where-Object { $_ })) {
+    if ($installLocation.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $underPortableRoot = $true
+      break
+    }
+  }
+
+  if (-not $underPortableRoot) { return $false }
+
+  return ([string]$Entry.UninstallString) -match '(^|\s)winget(\.exe)?\s+uninstall\s+--product-code\s+'
+}
+
+function Get-WingetPortablePackageList {
+  $packages = New-Object System.Collections.Generic.List[object]
+
+  foreach ($entry in @(Get-CachedUninstallEntries)) {
+    if (-not (Test-IsWingetPortablePackageEntry -Entry $entry)) { continue }
+
+    $scope = Get-ScopeFromEntry -Entry $entry
+    $note = 'Portable winget package. Cleanup mode removes the package registration and package directory with --purge.'
+    if ($scope -eq 'Machine') {
+      $note = 'Machine-scope portable winget package. Cleanup mode uses --purge and may require elevation.'
+    }
+
+    $packages.Add([pscustomobject]@{
+      Name            = [string]$entry.DisplayName
+      Id              = [string]$entry.ProductCode
+      ProductCode     = [string]$entry.ProductCode
+      Installed       = [string]$entry.DisplayVersion
+      Available       = $null
+      Source          = 'winget'
+      InstallScope    = $scope
+      ScopeNote       = $note
+      Provider        = 'WingetPortableCleanup'
+      InstallLocation = [string]$entry.InstallLocation
+    })
+  }
+
+  return @(
+    $packages |
+      Sort-Object @{ Expression = { if ($_.InstallScope -eq 'Machine') { 0 } elseif ($_.InstallScope -eq 'User') { 1 } else { 2 } } }, Name, Installed
+  )
+}
+
 function Show-NumberedUpgrades($packages) {
   Write-Host "`n=== Available upgrade candidates ===`n"
   $machineCount = @($packages | Where-Object InstallScope -eq 'Machine').Count
@@ -677,12 +750,126 @@ function Select-Upgrades([object[]]$Packages) {
   )
 }
 
-function Prompt-RunMode {
-  $choices = [System.Management.Automation.Host.ChoiceDescription[]]@(
-    (New-Object System.Management.Automation.Host.ChoiceDescription "&Current session (no elevation)", "Run upgrades here without elevation"),
-    (New-Object System.Management.Automation.Host.ChoiceDescription "&Elevated window", "Launch a UAC prompt and run selected upgrades as admin")
+function Show-NumberedPortablePackages([object[]]$Packages) {
+  Write-Host "`n=== Installed winget portable packages ===`n"
+  $machineCount = @($Packages | Where-Object InstallScope -eq 'Machine').Count
+  $userCount = @($Packages | Where-Object InstallScope -eq 'User').Count
+  $unknownCount = @($Packages | Where-Object { $_.InstallScope -ne 'Machine' -and $_.InstallScope -ne 'User' }).Count
+
+  Write-Host ("{0} package(s): {1} machine, {2} user, {3} unknown`n" -f $Packages.Count, $machineCount, $userCount, $unknownCount) -ForegroundColor DarkCyan
+  Write-Host "Cleanup mode uses winget uninstall --purge, which removes the package directory for the selected portable package.`n" -ForegroundColor DarkYellow
+
+  $groupedPackages = @(
+    [pscustomobject]@{ Label = 'Machine-scope packages'; Items = @($Packages | Where-Object InstallScope -eq 'Machine') }
+    [pscustomobject]@{ Label = 'User-scope packages'; Items = @($Packages | Where-Object InstallScope -eq 'User') }
+    [pscustomobject]@{ Label = 'Other packages'; Items = @($Packages | Where-Object { $_.InstallScope -ne 'Machine' -and $_.InstallScope -ne 'User' }) }
   )
-  return $Host.UI.PromptForChoice("Run location", "Where should the selected upgrades run?", $choices, 0)
+
+  $indexWidth = [Math]::Max(2, [string]$Packages.Count).Length
+  $nameWidth = 34
+  $versionWidth = 16
+  $i = 1
+
+  foreach ($group in $groupedPackages) {
+    if (-not $group.Items.Count) { continue }
+
+    Write-Host $group.Label -ForegroundColor Cyan
+    foreach ($pkg in $group.Items) {
+      $installed = if ($pkg.Installed) { [string]$pkg.Installed } else { 'unknown' }
+      $displayName = [string]$pkg.Name
+      if ($displayName.Length -gt $nameWidth) {
+        $displayName = $displayName.Substring(0, $nameWidth - 3) + '...'
+      }
+
+      $badge = switch ($pkg.InstallScope) {
+        'User' { '[User]' }
+        'Machine' { '[Machine]' }
+        default { '[Unknown]' }
+      }
+
+      $primaryLine = "[{0}] {1} {2} {3}" -f `
+        $i.ToString().PadLeft($indexWidth),
+        $displayName.PadRight($nameWidth),
+        $installed.PadRight($versionWidth),
+        $badge
+
+      Write-Host $primaryLine
+      $details = @("Product code: $($pkg.ProductCode)")
+      if ($pkg.InstallLocation) { $details += "Install: $($pkg.InstallLocation)" }
+      if ($pkg.ScopeNote) { $details += "Details: $($pkg.ScopeNote)" }
+      Write-Host ("     " + ($details -join ' | ')) -ForegroundColor DarkGray
+      $i++
+    }
+
+    Write-Host ""
+  }
+}
+
+function Select-WingetPortablePackagesWithGrid([object[]]$Packages) {
+  Write-Host ""
+  Write-Host "Opening the portable package cleanup picker..." -ForegroundColor Cyan
+  Write-Host "Use Ctrl+Click for nonconsecutive rows, Shift+Click for ranges, and Ctrl+A for all rows. Choose OK to continue." -ForegroundColor DarkYellow
+
+  $rows = @(
+    $index = 1
+    foreach ($pkg in @($Packages)) {
+      [pscustomobject]@{
+        Index       = $index
+        Name        = [string]$pkg.Name
+        Version     = if ($pkg.Installed) { [string]$pkg.Installed } else { 'unknown' }
+        Scope       = if ($pkg.InstallScope) { [string]$pkg.InstallScope } else { 'Unknown' }
+        ProductCode = [string]$pkg.ProductCode
+        InstallPath = if ($pkg.InstallLocation) { [string]$pkg.InstallLocation } else { '' }
+        Note        = if ($pkg.ScopeNote) { [string]$pkg.ScopeNote } else { '' }
+      }
+      $index++
+    }
+  )
+
+  $selectedRows = @(
+    $rows |
+      Out-GridView -Title "Select installed portable packages to remove | Ctrl+Click: multi-select | Shift+Click: range | Ctrl+A: all | OK: continue" -OutputMode Multiple
+  )
+
+  if (-not $selectedRows -or $selectedRows.Count -eq 0) { return @() }
+
+  $selectedPackages = foreach ($row in $selectedRows) {
+    $selectedIndex = [int]$row.Index
+    if ($selectedIndex -ge 1 -and $selectedIndex -le $Packages.Count) {
+      $Packages[$selectedIndex - 1]
+    }
+  }
+
+  return @($selectedPackages | Where-Object { $_ })
+}
+
+function Select-WingetPortablePackages([object[]]$Packages) {
+  if (Test-OutGridViewAvailable) {
+    return @(Select-WingetPortablePackagesWithGrid -Packages $Packages)
+  }
+
+  Write-Warning "Out-GridView is not available in this session. Falling back to text selection."
+  Show-NumberedPortablePackages -Packages $Packages
+  $selectedIndexes = Prompt-SelectionText -Count $Packages.Count
+  if (-not $selectedIndexes -or $selectedIndexes.Count -eq 0) { return @() }
+
+  return @(
+    foreach ($idx in $selectedIndexes) {
+      $Packages[$idx - 1]
+    }
+  )
+}
+
+function Prompt-RunMode {
+  param(
+    [string]$ActionLabel = 'selected package changes'
+  )
+
+  $choices = [System.Management.Automation.Host.ChoiceDescription[]]@(
+    (New-Object System.Management.Automation.Host.ChoiceDescription "&Current session (no elevation)", "Run $ActionLabel here without elevation"),
+    (New-Object System.Management.Automation.Host.ChoiceDescription "&Elevated window", "Launch a UAC prompt and run $ActionLabel as admin")
+  )
+  return $Host.UI.PromptForChoice("Run location", "Where should the $ActionLabel run?", $choices, 0)
 }
 
 function Convert-ToHexCode {
@@ -912,6 +1099,70 @@ function Start-SelectedUpgrades {
   }
 }
 
+function Start-WingetPortableUninstallSelected {
+  param(
+    [object[]]$Packages,
+    [string]$Stage
+  )
+
+  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return }
+
+  foreach ($pkg in @($Packages)) {
+    if (-not $pkg.ProductCode) { continue }
+    $safeId = ($pkg.ProductCode -replace '[^A-Za-z0-9._-]','_')
+    $logDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'winget-update-script-logs'
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+    $wingetLogPath = Join-Path -Path $logDir -ChildPath ("cleanup-{0}-{1}.log" -f $safeId, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+
+    $args = @(
+      'uninstall',
+      '--product-code', $pkg.ProductCode,
+      '--purge',
+      '--silent',
+      '--disable-interactivity',
+      '--accept-source-agreements',
+      '--log', $wingetLogPath
+    )
+    if ($pkg.Source) { $args += @('--source', $pkg.Source) }
+    Write-Host "`n[$Stage] Running: winget $($args -join ' ')"
+
+    $wingetOutput = @(& winget @args 2>&1 | Tee-Object -Variable wingetOutputBuffer)
+    $wingetExitCode = $LASTEXITCODE
+    if ($wingetOutputBuffer) {
+      $wingetOutput = @($wingetOutputBuffer | ForEach-Object { [string]$_ })
+    }
+
+    $installerExitCode = Get-InstallerExitCodeFromLog -Path $wingetLogPath
+
+    if ($wingetExitCode -ne 0) {
+      $wingetHex = Convert-ToHexCode -Code $wingetExitCode
+      $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines $wingetOutput
+      $warningText = "winget cleanup failed for $($pkg.ProductCode) in $Stage. winget code: $wingetExitCode ($wingetHex)"
+      if ($installerExitCode -ne $null) {
+        $warningText += "; installer code: $installerExitCode"
+      }
+      if ($installerHint) {
+        $warningText += ". $installerHint"
+      }
+      Write-Warning $warningText
+
+      $script:InstallerFailures += [pscustomobject]@{
+        Id                = $pkg.ProductCode
+        Provider          = 'WingetPortableCleanup'
+        Stage             = $Stage
+        ExitCode          = $wingetExitCode
+        ExitCodeHex       = $wingetHex
+        InstallerExitCode = $installerExitCode
+        InstallerHint     = $installerHint
+        WingetHint        = $null
+        RetryHint         = $null
+        LogPath           = $wingetLogPath
+        InstallScope      = $pkg.InstallScope
+      }
+    }
+  }
+}
+
 function Summarize-LogReason {
   param([string]$Path)
   if (-not $Path -or -not (Test-Path $Path)) { return $null }
@@ -988,7 +1239,8 @@ function Analyze-FailuresWithCodex {
 function Start-MachinePhase {
   param(
     [string[]]$Ids,
-    [switch]$NonSilent
+    [switch]$NonSilent,
+    [switch]$CleanupPortablePackages
   )
 
   if (-not $Ids -or $Ids.Count -eq 0) { return }
@@ -1002,6 +1254,9 @@ function Start-MachinePhase {
   )
   if ($NonSilent) {
     $argList += '-NonSilentPhase'
+  }
+  if ($CleanupPortablePackages) {
+    $argList += '-CleanupPortablePackages'
   }
   $argList += @(
     '-SelectedList',"`"$csv`""
@@ -1137,6 +1392,64 @@ try {
   Ensure-WingetMsStoreSource
 
   if (-not $MachinePhase) {
+    if ($CleanupPortablePackages) {
+      $portablePackages = @(Get-WingetPortablePackageList)
+      if (-not $portablePackages -or $portablePackages.Count -eq 0) {
+        Write-Host "No installed winget portable packages were found for cleanup."
+        Exit-WithPause
+      }
+
+      $selectedPackages = @(Select-WingetPortablePackages -Packages $portablePackages)
+      if (-not $selectedPackages -or $selectedPackages.Count -eq 0) {
+        Write-Host "No selection made. Exiting without changes."
+        Exit-WithPause
+      }
+
+      $runMode = Prompt-RunMode -ActionLabel 'selected package removals'
+      if ($runMode -eq 0) {
+        Start-WingetPortableUninstallSelected -Packages $selectedPackages -Stage 'Current session cleanup'
+
+        if ($script:InstallerFailures.Count -gt 0) {
+          Summarize-Failures -Failures $script:InstallerFailures
+
+          $failedMachineIds = @(
+            $script:InstallerFailures |
+              Where-Object { $_.Provider -eq 'WingetPortableCleanup' -and $_.InstallScope -ne 'User' } |
+              Select-Object -ExpandProperty Id -Unique
+          )
+          if ($failedMachineIds.Count -gt 0 -and (Prompt-RetryFailedInElevated)) {
+            Start-MachinePhase -Ids $failedMachineIds -CleanupPortablePackages
+            Write-Host "Opening an elevated window to retry failed package removals..."
+          }
+        } else {
+          Write-Host "`nSelected package removals completed successfully."
+        }
+
+        Exit-WithPause
+      }
+
+      $userScopedPackages = @($selectedPackages | Where-Object { $_.InstallScope -eq 'User' })
+      $machineScopedPackages = @($selectedPackages | Where-Object { $_.InstallScope -ne 'User' })
+
+      if ($userScopedPackages.Count -gt 0) {
+        $userScopedIds = ($userScopedPackages | Select-Object -ExpandProperty ProductCode) -join ', '
+        Write-Host "Removing user-scope packages in the current session: $userScopedIds" -ForegroundColor Yellow
+        Start-WingetPortableUninstallSelected -Packages $userScopedPackages -Stage 'Current session cleanup (user-scope)'
+        if ($script:InstallerFailures.Count -gt 0) {
+          Summarize-Failures -Failures $script:InstallerFailures
+        }
+      }
+
+      if ($machineScopedPackages.Count -gt 0) {
+        Start-MachinePhase -Ids ($machineScopedPackages | Select-Object -ExpandProperty ProductCode) -CleanupPortablePackages
+        Write-Host "Opening an elevated window to run machine-scope package removals..."
+      } else {
+        Write-Host "No machine-scope packages remain after filtering out user-scope installs."
+      }
+
+      Exit-WithPause
+    }
+
     $upgrades = Get-UpgradeList
     if (-not $upgrades -or $upgrades.Count -eq 0) {
       Write-Host "No upgrades found from winget or Python Install Manager."
@@ -1148,7 +1461,7 @@ try {
       Write-Host "No selection made. Exiting without changes."
       Exit-WithPause
     }
-    $runMode = Prompt-RunMode
+    $runMode = Prompt-RunMode -ActionLabel 'selected upgrades'
     $deferredPowerShellPackages = @($selectedPackages | Where-Object { Test-IsDeferredPowerShellPackage -Package $_ })
     $immediatePackages = @($selectedPackages | Where-Object { -not (Test-IsDeferredPowerShellPackage -Package $_) })
     if ($runMode -eq 0) {
@@ -1235,15 +1548,30 @@ try {
     Exit-WithPause
   }
 
-  $machinePackages = foreach ($id in $machineIds) { [pscustomobject]@{ Name = $id; Id = $id; Source = $null; Provider = 'Winget' } }
-  $machineStage = if ($NonSilentPhase) { "Machine-scope (non-silent retry)" } else { "Machine-scope" }
-  Start-SelectedUpgrades -Packages $machinePackages -Stage $machineStage -NonSilent:$NonSilentPhase
+  if ($CleanupPortablePackages) {
+    $machinePackages = foreach ($id in $machineIds) {
+      [pscustomobject]@{
+        Name         = $id
+        Id           = $id
+        ProductCode  = $id
+        Source       = 'winget'
+        Provider     = 'WingetPortableCleanup'
+        InstallScope = 'Machine'
+      }
+    }
+    $machineStage = "Machine-scope cleanup"
+    Start-WingetPortableUninstallSelected -Packages $machinePackages -Stage $machineStage
+  } else {
+    $machinePackages = foreach ($id in $machineIds) { [pscustomobject]@{ Name = $id; Id = $id; Source = $null; Provider = 'Winget' } }
+    $machineStage = if ($NonSilentPhase) { "Machine-scope (non-silent retry)" } else { "Machine-scope" }
+    Start-SelectedUpgrades -Packages $machinePackages -Stage $machineStage -NonSilent:$NonSilentPhase
+  }
   if ($script:InstallerFailures.Count -gt 0) {
     Write-Host "`n$machineStage completed with failures."
     Analyze-FailuresWithCodex -Failures $script:InstallerFailures
     Summarize-Failures -Failures $script:InstallerFailures
 
-    if (-not $NonSilentPhase) {
+    if (-not $CleanupPortablePackages -and -not $NonSilentPhase) {
       $failedIds = @($script:InstallerFailures | Select-Object -ExpandProperty Id -Unique)
       if ($failedIds.Count -gt 0 -and (Prompt-RetryFailedNonSilent -ScopeDescription "this elevated window")) {
         $script:InstallerFailures = @()

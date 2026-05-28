@@ -69,6 +69,22 @@ Notes:
 - The remote session must already have enough rights to run `winget`; this script does not try to open a UAC prompt remotely.
 - Some Microsoft Store or per-user installs may still behave differently in a remote admin session than they do in a local interactive desktop session.
 
+## Portable package cleanup
+
+If you want to remove installed `winget` portable packages and delete their package directories through `winget uninstall --purge`, run:
+
+```powershell
+pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\windows-update-scripts\winget-ms-store-update-all.ps1 -CleanupPortablePackages
+```
+
+This cleanup mode is explicit on purpose:
+
+- it lists installed portable packages registered with `winget uninstall --product-code`
+- it lets you choose which ones to remove
+- it does not automatically remove a different major version just because a newer branch is installed
+
+For example, `PHP.PHP.8.2` and `PHP.PHP.8.3` are separate packages. Cleanup mode lets you remove one or both intentionally.
+
 ## Validation
 
 After changing [`winget-ms-store-update-all.ps1`](/E:/Sandbox/danmade-playground/windows-update-scripts/winget-ms-store-update-all.ps1), run:
