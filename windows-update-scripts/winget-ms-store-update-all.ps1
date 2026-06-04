@@ -17,6 +17,7 @@ $script:InstallerFailures = @()
 $script:FailureHistory = @()
 $script:RestartRequiredPackages = @()
 $script:CachedUninstallEntries = $null
+$script:PythonInstallManagerDiagnostics = @()
 $script:DeferredPowerShellPackageIds = @('Microsoft.PowerShell')
 
 # Args for single-package upgrade runs. Do not include --all/--recurse (those are for bulk upgrades).
@@ -233,6 +234,80 @@ function Compare-VersionText {
   return [string]::Compare($Left, $Right, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Add-PythonInstallManagerDiagnostic {
+  param([string]$Message)
+
+  if ([string]::IsNullOrWhiteSpace($Message)) { return }
+  $script:PythonInstallManagerDiagnostics += $Message
+}
+
+function Get-PythonRuntimeTags {
+  param([object]$Runtime)
+
+  $tags = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  if ($Runtime) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$Runtime.tag)) { $null = $tags.Add([string]$Runtime.tag) }
+    foreach ($item in @($Runtime.'install-for')) {
+      if (-not [string]::IsNullOrWhiteSpace([string]$item)) { $null = $tags.Add([string]$item) }
+    }
+    foreach ($item in @($Runtime.'run-for')) {
+      if ($item -and -not [string]::IsNullOrWhiteSpace([string]$item.tag)) { $null = $tags.Add([string]$item.tag) }
+    }
+  }
+  return @($tags)
+}
+
+function Test-IsPythonRuntimeOnlineMatch {
+  param(
+    [object]$Runtime,
+    [object]$Candidate,
+    [string[]]$RuntimeTags
+  )
+
+  if (-not $Runtime -or -not $Candidate) { return $false }
+
+  $runtimeId = [string]$Runtime.id
+  $candidateId = [string]$Candidate.id
+  if ($runtimeId -and $candidateId -and $runtimeId -eq $candidateId) { return $true }
+
+  $candidateTag = [string]$Candidate.tag
+  if ($candidateTag -and @($RuntimeTags) -contains $candidateTag) { return $true }
+
+  foreach ($item in @($Candidate.'install-for')) {
+    if ($item -and @($RuntimeTags) -contains [string]$item) { return $true }
+  }
+
+  return $false
+}
+
+function Get-PythonInstallManagerDryRunSummary {
+  param(
+    [string]$PyPath,
+    [string]$Tag
+  )
+
+  if ([string]::IsNullOrWhiteSpace($PyPath) -or [string]::IsNullOrWhiteSpace($Tag)) { return $null }
+
+  try {
+    $output = & $PyPath install --update --dry-run $Tag 2>&1
+    if (-not $output) { return $null }
+    $interesting = @(
+      $output |
+        Where-Object {
+          $line = [string]$_
+          -not [string]::IsNullOrWhiteSpace($line) -and
+            $line -notmatch '^The signature for .+ was successfully verified\.$' -and
+            $line -notmatch '^Skipping shortcut refresh due to --dry-run$'
+        } |
+        Select-Object -First 3
+    )
+    if (-not $interesting -or $interesting.Count -eq 0) { return $null }
+    return ($interesting -join ' ').Trim()
+  } catch {
+    return "dry-run failed: $($_.Exception.Message)"
+  }
+}
+
 function Ensure-WingetMsStoreSource {
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Warning "winget not found."
@@ -266,6 +341,47 @@ function Normalize-WingetPackageId {
   if ($match.Success) { return $match.Value }
 
   return $candidate
+}
+
+function Test-IsPlainVersionToken {
+  param([string]$Text)
+
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+  return $Text.Trim() -match '^\d+(?:\.\d+)+(?:[-+._][A-Za-z0-9]+)?$'
+}
+
+function ConvertFrom-WingetUpgradeTableRow {
+  param([string]$Line)
+
+  if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+
+  $idMatches = [regex]::Matches($Line, '(?<=^|\s)[A-Za-z0-9][A-Za-z0-9._+-]*(?=\s)')
+  for ($i = $idMatches.Count - 1; $i -ge 0; $i--) {
+    $candidate = $idMatches[$i]
+    if (Test-IsPlainVersionToken -Text $candidate.Value) { continue }
+    $name = $Line.Substring(0, $candidate.Index).Trim()
+    $tail = $Line.Substring($candidate.Index + $candidate.Length).Trim()
+    if ([string]::IsNullOrWhiteSpace($name) -or [string]::IsNullOrWhiteSpace($tail)) { continue }
+
+    $tailMatch = [regex]::Match(
+      $tail,
+      '^(?<Installed>(?:[<>]=?\s*)?\S+(?:\s+\([^)]+\))?)\s+(?<Available>(?:[<>]=?\s*)?\S+(?:\s+\([^)]+\))?)\s+(?<Source>\S+)\s*$'
+    )
+    if (-not $tailMatch.Success) { continue }
+
+    $id = Normalize-WingetPackageId -RawId $candidate.Value
+    if (-not $id) { continue }
+
+    return [pscustomobject]@{
+      Name      = $name
+      Id        = $id
+      Installed = $tailMatch.Groups['Installed'].Value.Trim()
+      Available = $tailMatch.Groups['Available'].Value.Trim()
+      Source    = $tailMatch.Groups['Source'].Value.Trim()
+    }
+  }
+
+  return $null
 }
 
 function Get-WingetUpgradeList {
@@ -398,32 +514,14 @@ function Get-WingetUpgradeList {
 
     $headerIndex = [array]::IndexOf($lines, $header)
     $candidateLines = $lines | Select-Object -Skip ($headerIndex + 2)
-    # Some winget rows collapse to single-space separators when columns are full width.
-    # Accept both dotted and non-dotted package identifiers.
-    $rowPattern = '^(?<Name>.+?)\s+(?<Id>[A-Za-z0-9][A-Za-z0-9._+-]*)\s+(?<Installed>\S+)\s+(?<Available>\S+)\s+(?<Source>\S+)\s*$'
-
     $parsed = foreach ($line in $candidateLines) {
       if ([string]::IsNullOrWhiteSpace($line)) { continue }
       if ($line -match '^[-\s]+$') { continue }
       if ($line -match '^\d+\s+upgrades available\.?$') { continue }
       if ($line -match '^The following packages have an upgrade available') { continue }
 
-      if ($line -notmatch $rowPattern) { continue }
-      $name = $matches['Name'].Trim()
-      $id = Normalize-WingetPackageId -RawId $matches['Id']
-      $installed = $matches['Installed'].Trim()
-      $available = $matches['Available'].Trim()
-      $source = $matches['Source'].Trim()
-
-      if (-not $id) { continue }
-
-      [pscustomobject]@{
-        Name      = $name
-        Id        = $id
-        Installed = $installed
-        Available = $available
-        Source    = $source
-      }
+      $pkg = ConvertFrom-WingetUpgradeTableRow -Line $line
+      if ($pkg) { $pkg }
     }
     return @(
       foreach ($pkg in $parsed) {
@@ -441,26 +539,38 @@ function Get-WingetUpgradeList {
 }
 
 function Get-PythonInstallManagerUpgradeList {
+  $script:PythonInstallManagerDiagnostics = @()
   $py = Get-Command py -ErrorAction SilentlyContinue
-  if (-not $py) { return @() }
+  if (-not $py) {
+    Add-PythonInstallManagerDiagnostic -Message "Python Install Manager was skipped because 'py' was not found on PATH."
+    return @()
+  }
 
   $installedJson = $null
   try {
     $installedJson = & $py.Path list --only-managed -f json 2>$null
   } catch {
+    Add-PythonInstallManagerDiagnostic -Message "Python Install Manager managed-runtime listing failed: $($_.Exception.Message)"
     return @()
   }
-  if (-not $installedJson) { return @() }
+  if (-not $installedJson) {
+    Add-PythonInstallManagerDiagnostic -Message "Python Install Manager reported no managed-runtime JSON."
+    return @()
+  }
 
   try {
     $installedData = ($installedJson -join "`n") | ConvertFrom-Json -ErrorAction Stop
   } catch {
     Write-Verbose "Python Install Manager JSON parse failed. $_"
+    Add-PythonInstallManagerDiagnostic -Message "Python Install Manager managed-runtime JSON could not be parsed."
     return @()
   }
 
   $installedVersions = @($installedData.versions)
-  if (-not $installedVersions -or $installedVersions.Count -eq 0) { return @() }
+  if (-not $installedVersions -or $installedVersions.Count -eq 0) {
+    Add-PythonInstallManagerDiagnostic -Message "Python Install Manager found no managed runtimes."
+    return @()
+  }
 
   $results = New-Object System.Collections.Generic.List[object]
   foreach ($runtime in $installedVersions) {
@@ -470,13 +580,16 @@ function Get-PythonInstallManagerUpgradeList {
     $installed = [string]$runtime.'sort-version'
     $displayName = [string]$runtime.'display-name'
     if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = "Python $tag" }
+    $runtimeId = [string]$runtime.id
+    $executable = [string]$runtime.executable
+    $runtimeTags = @(Get-PythonRuntimeTags -Runtime $runtime)
 
     $latest = $null
     try {
       $onlineJson = & $py.Path list --online -f json $tag 2>$null
       if ($onlineJson) {
         $onlineData = ($onlineJson -join "`n") | ConvertFrom-Json -ErrorAction Stop
-        $onlineMatches = @($onlineData.versions | Where-Object { [string]$_.tag -eq $tag })
+        $onlineMatches = @($onlineData.versions | Where-Object { Test-IsPythonRuntimeOnlineMatch -Runtime $runtime -Candidate $_ -RuntimeTags $runtimeTags })
         if (-not $onlineMatches -or $onlineMatches.Count -eq 0) {
           $onlineMatches = @($onlineData.versions)
         }
@@ -491,10 +604,22 @@ function Get-PythonInstallManagerUpgradeList {
       }
     } catch {
       Write-Verbose "Python Install Manager online lookup failed for tag '$tag'. $_"
+      Add-PythonInstallManagerDiagnostic -Message "Python Install Manager online lookup failed for $displayName ($tag): $($_.Exception.Message)"
     }
 
-    if ([string]::IsNullOrWhiteSpace($latest)) { continue }
-    if ((Compare-VersionText -Left $latest -Right $installed) -le 0) { continue }
+    if ([string]::IsNullOrWhiteSpace($latest)) {
+      $dryRun = Get-PythonInstallManagerDryRunSummary -PyPath $py.Path -Tag $tag
+      $detail = if ($dryRun) { " $dryRun" } else { '' }
+      Add-PythonInstallManagerDiagnostic -Message "Managed Python $displayName ($tag) was found at '$executable', but no online version could be resolved.$detail"
+      continue
+    }
+
+    if ((Compare-VersionText -Left $latest -Right $installed) -le 0) {
+      $dryRun = Get-PythonInstallManagerDryRunSummary -PyPath $py.Path -Tag $tag
+      $detail = if ($dryRun) { " Dry-run: $dryRun" } else { '' }
+      Add-PythonInstallManagerDiagnostic -Message "Managed Python $displayName ($runtimeId/$tag) at '$executable' is already current: installed $installed, online $latest.$detail"
+      continue
+    }
 
     $results.Add([pscustomobject]@{
       Name       = $displayName
@@ -515,7 +640,15 @@ function Get-PythonInstallManagerUpgradeList {
 function Get-UpgradeList {
   $all = New-Object System.Collections.Generic.List[object]
   foreach ($pkg in @(Get-WingetUpgradeList)) { $all.Add($pkg) }
-  foreach ($pkg in @(Get-PythonInstallManagerUpgradeList)) { $all.Add($pkg) }
+  $pythonPackages = @(Get-PythonInstallManagerUpgradeList)
+  foreach ($pkg in $pythonPackages) { $all.Add($pkg) }
+
+  if ($pythonPackages.Count -eq 0 -and $script:PythonInstallManagerDiagnostics.Count -gt 0) {
+    Write-Host "Python Install Manager diagnostics:" -ForegroundColor DarkGray
+    foreach ($message in $script:PythonInstallManagerDiagnostics) {
+      Write-Host "  - $message" -ForegroundColor DarkGray
+    }
+  }
 
   if ($TestModeAddPowerShell) {
     $hasPowerShell = @($all | Where-Object { $_.Id -eq 'Microsoft.PowerShell' }).Count -gt 0
