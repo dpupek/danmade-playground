@@ -1324,7 +1324,11 @@ function Start-WingetSelected {
       $wingetHex = Convert-ToHexCode -Code $wingetExitCode
       $previousFailure = Get-MostRecentFailureForPackage -Id $pkg.Id
       $wingetHint = Get-WingetFailureHint -WingetExitCode $wingetExitCode -Package $pkg -Stage $Stage -LogPath $wingetLogPath -DiagnosticContext $diagnosticContext -PreviousFailure $previousFailure
-      $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines $wingetOutput -DiagnosticText (if ($diagnosticContext) { $diagnosticContext.CliLogText } else { $null })
+      $diagnosticText = $null
+      if ($diagnosticContext) {
+        $diagnosticText = $diagnosticContext.CliLogText
+      }
+      $installerHint = Get-InstallerExitHint -InstallerExitCode $installerExitCode -OutputLines $wingetOutput -DiagnosticText $diagnosticText
       $warningText = "winget failed for $($pkg.Id) in $Stage. winget code: $wingetExitCode ($wingetHex)"
       if ($installerExitCode -ne $null) {
         $warningText += "; installer code: $installerExitCode"
@@ -1348,7 +1352,7 @@ function Start-WingetSelected {
         RetryHint         = $null
         LogPath           = $wingetLogPath
         InstallScope      = $pkg.InstallScope
-        CliLogPath        = if ($diagnosticContext) { $diagnosticContext.CliLogPath } else { $null }
+        CliLogPath        = $diagnosticContext.CliLogPath
         RebootRequired    = $false
       })
     }
