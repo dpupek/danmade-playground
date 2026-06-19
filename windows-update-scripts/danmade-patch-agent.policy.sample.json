@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+  "includeUnknown": true,
+  "allowedPackageIds": [],
+  "blockedPackageIds": [],
+  "maxRetries": 2,
+  "maintenanceWindow": {
+    "enabled": false,
+    "start": "02:00",
+    "end": "04:00"
+  },
+  "rebootPolicy": "ReportOnly",
+  "wazuhReporting": {
+    "eventLog": true,
+    "jsonl": true
+  },
+  "wingetSourceRepair": true,
+  "logRetentionDays": 30
+}

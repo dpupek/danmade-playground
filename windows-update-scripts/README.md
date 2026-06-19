@@ -69,6 +69,18 @@ Notes:
 - The remote session must already have enough rights to run `winget`; this script does not try to open a UAC prompt remotely.
 - Some Microsoft Store or per-user installs may still behave differently in a remote admin session than they do in a local interactive desktop session.
 
+## Danmade Patch Agent
+
+Use [`danmade-patch-agent.ps1`](/E:/Sandbox/danmade-playground/windows-update-scripts/danmade-patch-agent.ps1) for unattended domain-managed patching through Group Policy scheduled tasks.
+
+The patch agent is intentionally separate from the interactive updater:
+- no prompts, `Out-GridView`, UAC relaunches, or end-of-run pause
+- policy-driven package allow/block lists and retry limits
+- Wazuh-friendly Windows Event Log and JSONL reporting
+- designed to be signed with a Domain CA code-signing certificate and run under `AllSigned`
+
+Start with [`danmade-patch-agent.policy.sample.json`](/E:/Sandbox/danmade-playground/windows-update-scripts/danmade-patch-agent.policy.sample.json), then follow the deployment and signing guide in [`docs/danmade-patch-agent/admin-guide.md`](/E:/Sandbox/danmade-playground/docs/danmade-patch-agent/admin-guide.md).
+
 ## Portable package cleanup
 
 If you want to remove installed `winget` portable packages and delete their package directories through `winget uninstall --purge`, run:
