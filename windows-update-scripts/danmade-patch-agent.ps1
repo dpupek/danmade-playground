@@ -18,11 +18,19 @@ param(
 
   [string]$RunId,
 
-  [string]$LogRoot = 'C:\ProgramData\DanmadePatchAgent'
+  [string]$LogRoot
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($LogRoot)) {
+  $LogRoot = if ($Mode -eq 'User' -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    Join-Path -Path $env:LOCALAPPDATA -ChildPath 'DanmadePatchAgent'
+  } else {
+    'C:\ProgramData\DanmadePatchAgent'
+  }
+}
 
 $script:SchemaVersion = '1.0'
 $script:EventSource = 'DanmadePatchAgent'
@@ -156,6 +164,55 @@ function Convert-ToHexCode {
   return ('0x{0:X8}' -f $unsigned)
 }
 
+function Join-ProcessArguments {
+  param([string[]]$Arguments)
+
+  return (@(
+    foreach ($argument in @($Arguments)) {
+      if ($null -eq $argument) { continue }
+      $text = [string]$argument
+      if ($text -match '[\s"]') {
+        '"' + ($text -replace '"', '\"') + '"'
+      } else {
+        $text
+      }
+    }
+  ) -join ' ')
+}
+
+function Invoke-WingetProcess {
+  param(
+    [string[]]$Arguments,
+    [int]$TimeoutSeconds = 180
+  )
+
+  $stdoutPath = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("danmade-winget-{0}.out" -f ([guid]::NewGuid()))
+  $stderrPath = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("danmade-winget-{0}.err" -f ([guid]::NewGuid()))
+  $argumentList = Join-ProcessArguments -Arguments $Arguments
+
+  try {
+    $process = Start-Process -FilePath $script:WingetCommand -ArgumentList $argumentList -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+      try { $process.Kill() } catch { }
+      return [pscustomobject]@{
+        ExitCode = -1
+        TimedOut = $true
+        StdOut   = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { '' }
+        StdErr   = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+      }
+    }
+
+    return [pscustomobject]@{
+      ExitCode = [int]$process.ExitCode
+      TimedOut = $false
+      StdOut   = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { '' }
+      StdErr   = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+    }
+  } finally {
+    Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Normalize-DisplayText {
   param([string]$Text)
 
@@ -181,7 +238,92 @@ function Initialize-AgentStorage {
   Ensure-Directory -Path $LogRoot
   Ensure-Directory -Path (Join-Path -Path $LogRoot -ChildPath 'Logs')
   Ensure-Directory -Path (Join-Path -Path $LogRoot -ChildPath 'Events')
+  Ensure-Directory -Path (Join-Path -Path $LogRoot -ChildPath 'State')
   $script:JsonlPath = Join-Path -Path $LogRoot -ChildPath 'Events\patch-agent.jsonl'
+}
+
+function Get-NotificationStatePath {
+  return (Join-Path -Path $LogRoot -ChildPath 'State\pending-notification.json')
+}
+
+function Write-NotificationState {
+  param(
+    [string]$Status,
+    [hashtable]$Summary,
+    [object[]]$RestartRequiredPackages,
+    [object[]]$FailedPackages
+  )
+
+  if ($Status -notin @('CompletedRestartRequired', 'CompletedWithFailures', 'PreflightFailed', 'UnhandledAgentError')) {
+    return
+  }
+
+  $statePath = Get-NotificationStatePath
+  $succeededCount = 0
+  $restartRequiredCount = 0
+  $failedCount = 0
+  if ($Summary.ContainsKey('Succeeded')) { $succeededCount = [int]$Summary.Succeeded }
+  if ($Summary.ContainsKey('RestartRequired')) { $restartRequiredCount = [int]$Summary.RestartRequired }
+  if ($Summary.ContainsKey('Failed')) { $failedCount = [int]$Summary.Failed }
+
+  $state = [ordered]@{
+    schemaVersion           = '1.0'
+    source                  = 'DanmadePatchAgent'
+    computerName            = $env:COMPUTERNAME
+    mode                    = $Mode
+    runId                   = $script:RunId
+    status                  = $Status
+    timestamp               = (Get-Date).ToString('o')
+    summary                 = [ordered]@{
+      succeeded       = $succeededCount
+      restartRequired = $restartRequiredCount
+      failed          = $failedCount
+    }
+    restartRequiredPackages = @(
+      foreach ($pkg in @($RestartRequiredPackages)) {
+        [ordered]@{
+          id        = [string]$pkg.Id
+          name      = [string]$pkg.Name
+          available = [string]$pkg.Available
+          source    = [string]$pkg.Source
+        }
+      }
+    )
+    failedPackages          = @(
+      foreach ($pkg in @($FailedPackages)) {
+        [ordered]@{
+          id        = [string]$pkg.Id
+          name      = [string]$pkg.Name
+          available = [string]$pkg.Available
+          source    = [string]$pkg.Source
+        }
+      }
+    )
+  }
+
+  if ($PSCmdlet.ShouldProcess($statePath, 'Write pending notification state')) {
+    $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding utf8
+  }
+}
+
+function Clear-NotificationState {
+  param([switch]$PreserveRestartRequired)
+
+  $statePath = Get-NotificationStatePath
+  if (-not (Test-Path -LiteralPath $statePath)) { return }
+  if ($PreserveRestartRequired) {
+    try {
+      $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+      if ($state.PSObject.Properties['status'] -and [string]$state.status -eq 'CompletedRestartRequired') {
+        return
+      }
+    } catch {
+      # If state is unreadable, clear it so a corrupt notification does not keep nagging users.
+    }
+  }
+  if ($PSCmdlet.ShouldProcess($statePath, 'Clear pending notification state')) {
+    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+  }
 }
 
 function Initialize-EventSource {
@@ -561,13 +703,22 @@ function Add-WingetJsonPackages {
 }
 
 function Get-WingetUpgradeList {
-  $baseArgs = @('upgrade')
+  $baseArgs = @('upgrade', '--disable-interactivity', '--accept-source-agreements')
   if ($script:Policy.includeUnknown) { $baseArgs += '--include-unknown' }
 
   try {
-    $json = & $script:WingetCommand @($baseArgs + @('--output', 'json')) 2>$null
+    $jsonResult = Invoke-WingetProcess -Arguments ($baseArgs + @('--output', 'json')) -TimeoutSeconds 180
+    if ($jsonResult.TimedOut) {
+      Write-AgentEvent -EventId 5600 -EntryType Error -Fields @{
+        status            = 'WingetUpgradeListJsonTimedOut'
+        wingetExitCode    = $jsonResult.ExitCode
+        wingetExitCodeHex = Convert-ToHexCode -Code $jsonResult.ExitCode
+      } | Out-Null
+      throw 'winget JSON upgrade listing timed out'
+    }
+    $json = $jsonResult.StdOut
     if ($json) {
-      $jsonText = ($json -join "`n").Trim()
+      $jsonText = ([string]$json).Trim()
       $firstBraceIndex = $jsonText.IndexOfAny(@('[', '{'))
       if ($firstBraceIndex -ge 0) {
         $data = $jsonText.Substring($firstBraceIndex) | ConvertFrom-Json -ErrorAction Stop
@@ -589,10 +740,19 @@ function Get-WingetUpgradeList {
   }
 
   try {
-    $output = & $script:WingetCommand @baseArgs 2>$null
+    $tableResult = Invoke-WingetProcess -Arguments $baseArgs -TimeoutSeconds 180
+    if ($tableResult.TimedOut) {
+      Write-AgentEvent -EventId 5600 -EntryType Error -Fields @{
+        status            = 'WingetUpgradeListTableTimedOut'
+        wingetExitCode    = $tableResult.ExitCode
+        wingetExitCodeHex = Convert-ToHexCode -Code $tableResult.ExitCode
+      } | Out-Null
+      return @()
+    }
+    $output = $tableResult.StdOut
     if (-not $output) { return @() }
 
-    $lines = $output -split "`r?`n"
+    $lines = $output -split "`r`n|`n|`r"
     $header = $lines | Where-Object { $_ -match '^Name\s+Id\s+Version\s+Available\s+Source' } | Select-Object -First 1
     if (-not $header) { return @() }
 
@@ -641,7 +801,7 @@ function Select-PolicyPackages {
         continue
       }
       $scope = if ($pkg.PSObject.Properties['InstallScope']) { [string]$pkg.InstallScope } else { 'Unknown' }
-      if ($Mode -eq 'User' -and $scope -ne 'User') {
+      if ($Mode -eq 'User' -and $scope -eq 'Machine') {
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
           status    = 'SkippedScope'
@@ -693,8 +853,17 @@ function Invoke-WingetSourceUpdate {
     return $true
   }
 
-  & $script:WingetCommand source update | Out-Null
-  $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+  $result = Invoke-WingetProcess -Arguments @('source', 'update') -TimeoutSeconds 180
+  $exitCode = [int]$result.ExitCode
+  if ($result.TimedOut) {
+    Write-AgentEvent -EventId 5200 -EntryType Warning -Fields @{
+      status            = 'WingetSourceUpdateTimedOut'
+      wingetExitCode    = $exitCode
+      wingetExitCodeHex = Convert-ToHexCode -Code $exitCode
+      recoveryActions   = @('sourceUpdate')
+    } | Out-Null
+    return $false
+  }
   if ($exitCode -eq 0) {
     if ($AfterReset) {
       Write-AgentEvent -EventId 5500 -EntryType Information -Fields @{
@@ -720,8 +889,17 @@ function Invoke-WingetSourceReset {
     return $true
   }
 
-  & $script:WingetCommand source reset --force | Out-Null
-  $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+  $result = Invoke-WingetProcess -Arguments @('source', 'reset', '--force') -TimeoutSeconds 180
+  $exitCode = [int]$result.ExitCode
+  if ($result.TimedOut) {
+    Write-AgentEvent -EventId 5500 -EntryType Error -Fields @{
+      status            = 'WingetSourceRepairTimedOut'
+      wingetExitCode    = $exitCode
+      wingetExitCodeHex = Convert-ToHexCode -Code $exitCode
+      recoveryActions   = @('sourceReset')
+    } | Out-Null
+    return $false
+  }
   if ($exitCode -eq 0) {
     Write-AgentEvent -EventId 5200 -EntryType Warning -Fields @{
       status          = 'WingetSourceResetAttempted'
@@ -751,8 +929,16 @@ function Test-WingetPreflight {
   $script:WingetCommand = $wingetPath
 
   if ($PSCmdlet.ShouldProcess('winget --info', 'Verify winget health')) {
-    & $script:WingetCommand --info | Out-Null
-    $infoExitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+    $infoResult = Invoke-WingetProcess -Arguments @('--info') -TimeoutSeconds 60
+    $infoExitCode = [int]$infoResult.ExitCode
+    if ($infoResult.TimedOut) {
+      Write-AgentEvent -EventId 5600 -EntryType Error -Fields @{
+        status            = 'WingetInfoTimedOut'
+        wingetExitCode    = $infoExitCode
+        wingetExitCodeHex = Convert-ToHexCode -Code $infoExitCode
+      } | Out-Null
+      return $false
+    }
     if ($infoExitCode -ne 0) {
       Write-AgentEvent -EventId 5600 -EntryType Error -Fields @{
         status            = 'WingetInfoFailed'
@@ -796,24 +982,41 @@ function Invoke-PackageUpgrade {
     if ($Package.Source) { $args += @('--source', [string]$Package.Source) }
 
     if ($PSCmdlet.ShouldProcess([string]$Package.Id, "winget upgrade attempt $attempt")) {
-      & $script:WingetCommand @args
-      $wingetExitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
+      $upgradeResult = Invoke-WingetProcess -Arguments $args -TimeoutSeconds 1800
+      $wingetExitCode = [int]$upgradeResult.ExitCode
     } else {
       $wingetExitCode = 0
+      $upgradeResult = [pscustomobject]@{ TimedOut = $false }
     }
 
     $installerExitCode = Get-InstallerExitCodeFromLog -Path $packageLogPath
-    if ($wingetExitCode -eq 0) {
-      Write-AgentEvent -EventId 5100 -EntryType Information -Fields @{
+    if ($upgradeResult.TimedOut) {
+      if ($attempt -lt $maxAttempts) {
+        $recoveryActions.Add('retryAfterTimeout')
+        Write-AgentEvent -EventId 5200 -EntryType Warning -Fields @{
+          packageId         = [string]$Package.Id
+          status            = 'PackageUpgradeTimedOutRetryScheduled'
+          wingetExitCode    = $wingetExitCode
+          wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
+          installerExitCode = $installerExitCode
+          retryCount        = $retryCount
+          recoveryActions   = @($recoveryActions)
+          logPath           = $packageLogPath
+        } | Out-Null
+        continue
+      }
+
+      Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{
         packageId         = [string]$Package.Id
-        status            = 'Succeeded'
-        wingetExitCode    = 0
+        status            = 'PackageUpgradeTimedOut'
+        wingetExitCode    = $wingetExitCode
+        wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
         installerExitCode = $installerExitCode
         retryCount        = $retryCount
         recoveryActions   = @($recoveryActions)
         logPath           = $packageLogPath
       } | Out-Null
-      return 'Succeeded'
+      return 'Failed'
     }
 
     if ($installerExitCode -eq 3010) {
@@ -829,6 +1032,48 @@ function Invoke-PackageUpgrade {
         logPath           = $packageLogPath
       } | Out-Null
       return 'RestartRequired'
+    }
+
+    if ($null -ne $installerExitCode -and $installerExitCode -ne 0) {
+      if ($attempt -lt $maxAttempts) {
+        $recoveryActions.Add('retryInstallerFailure')
+        Write-AgentEvent -EventId 5200 -EntryType Warning -Fields @{
+          packageId         = [string]$Package.Id
+          status            = 'RetryScheduled'
+          wingetExitCode    = $wingetExitCode
+          wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
+          installerExitCode = $installerExitCode
+          retryCount        = $retryCount
+          recoveryActions   = @($recoveryActions)
+          logPath           = $packageLogPath
+        } | Out-Null
+        continue
+      }
+
+      Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{
+        packageId         = [string]$Package.Id
+        status            = 'Failed'
+        wingetExitCode    = $wingetExitCode
+        wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
+        installerExitCode = $installerExitCode
+        retryCount        = $retryCount
+        recoveryActions   = @($recoveryActions)
+        logPath           = $packageLogPath
+      } | Out-Null
+      return 'Failed'
+    }
+
+    if ($wingetExitCode -eq 0) {
+      Write-AgentEvent -EventId 5100 -EntryType Information -Fields @{
+        packageId         = [string]$Package.Id
+        status            = 'Succeeded'
+        wingetExitCode    = 0
+        installerExitCode = $installerExitCode
+        retryCount        = $retryCount
+        recoveryActions   = @($recoveryActions)
+        logPath           = $packageLogPath
+      } | Out-Null
+      return 'Succeeded'
     }
 
     if ($attempt -lt $maxAttempts) {
@@ -884,6 +1129,7 @@ try {
     Write-AgentEvent -EventId 5001 -EntryType Information -Fields @{
       status = 'DisabledByPolicy'
     } | Out-Null
+    Clear-NotificationState -PreserveRestartRequired
     exit 0
   }
 
@@ -891,6 +1137,7 @@ try {
     Write-AgentEvent -EventId 5001 -EntryType Information -Fields @{
       status = 'SkippedOutsideMaintenanceWindow'
     } | Out-Null
+    Clear-NotificationState -PreserveRestartRequired
     exit 0
   }
 
@@ -904,6 +1151,7 @@ try {
     Write-AgentEvent -EventId 5001 -EntryType Error -Fields @{
       status = 'PreflightFailed'
     } | Out-Null
+    Write-NotificationState -Status 'PreflightFailed' -Summary @{ Succeeded = 0; RestartRequired = 0; Failed = 1 } -RestartRequiredPackages @() -FailedPackages @()
     exit 2
   }
 
@@ -914,6 +1162,7 @@ try {
     Write-AgentEvent -EventId 5001 -EntryType Information -Fields @{
       status = 'NoPackagesSelected'
     } | Out-Null
+    Clear-NotificationState -PreserveRestartRequired
     exit 0
   }
 
@@ -922,11 +1171,18 @@ try {
     RestartRequired = 0
     Failed          = 0
   }
+  $restartRequiredPackages = New-Object System.Collections.Generic.List[object]
+  $failedPackages = New-Object System.Collections.Generic.List[object]
 
   foreach ($pkg in $selectedPackages) {
     $result = Invoke-PackageUpgrade -Package $pkg
     if ($summary.ContainsKey($result)) {
       $summary[$result]++
+    }
+    if ($result -eq 'RestartRequired') {
+      $restartRequiredPackages.Add($pkg)
+    } elseif ($result -eq 'Failed') {
+      $failedPackages.Add($pkg)
     }
   }
 
@@ -936,6 +1192,11 @@ try {
     packageId       = '*'
     recoveryActions = @("Succeeded=$($summary.Succeeded)", "RestartRequired=$($summary.RestartRequired)", "Failed=$($summary.Failed)")
   } | Out-Null
+  if ($finalStatus -eq 'Completed') {
+    Clear-NotificationState
+  } else {
+    Write-NotificationState -Status $finalStatus -Summary $summary -RestartRequiredPackages $restartRequiredPackages.ToArray() -FailedPackages $failedPackages.ToArray()
+  }
 
   if ($summary.Failed -gt 0) { exit 1 }
   exit 0
@@ -945,8 +1206,183 @@ try {
       status  = 'UnhandledAgentError'
       message = $_.Exception.Message
     } | Out-Null
+    Write-NotificationState -Status 'UnhandledAgentError' -Summary @{ Succeeded = 0; RestartRequired = 0; Failed = 1 } -RestartRequiredPackages @() -FailedPackages @()
   } catch {
     Write-Warning "Danmade Patch Agent failed before reporting was available: $($_.Exception.Message)"
   }
   exit 1
 }
+
+# SIG # Begin signature block
+# MIIgCwYJKoZIhvcNAQcCoIIf/DCCH/gCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBZWsFS26RKJ3kl
+# UCeo0/K6PbCzsw3bgAD+XERdIMNLraCCGiYwggWNMIIEdaADAgECAhAOmxiO+dAt
+# 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
+# EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
+# BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
+# Fw0zMTExMDkyMzU5NTlaMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2Vy
+# dCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lD
+# ZXJ0IFRydXN0ZWQgUm9vdCBHNDCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoC
+# ggIBAL/mkHNo3rvkXUo8MCIwaTPswqclLskhPfKK2FnC4SmnPVirdprNrnsbhA3E
+# MB/zG6Q4FutWxpdtHauyefLKEdLkX9YFPFIPUh/GnhWlfr6fqVcWWVVyr2iTcMKy
+# unWZanMylNEQRBAu34LzB4TmdDttceItDBvuINXJIB1jKS3O7F5OyJP4IWGbNOsF
+# xl7sWxq868nPzaw0QF+xembud8hIqGZXV59UWI4MK7dPpzDZVu7Ke13jrclPXuU1
+# 5zHL2pNe3I6PgNq2kZhAkHnDeMe2scS1ahg4AxCN2NQ3pC4FfYj1gj4QkXCrVYJB
+# MtfbBHMqbpEBfCFM1LyuGwN1XXhm2ToxRJozQL8I11pJpMLmqaBn3aQnvKFPObUR
+# WBf3JFxGj2T3wWmIdph2PVldQnaHiZdpekjw4KISG2aadMreSx7nDmOu5tTvkpI6
+# nj3cAORFJYm2mkQZK37AlLTSYW3rM9nF30sEAMx9HJXDj/chsrIRt7t/8tWMcCxB
+# YKqxYxhElRp2Yn72gLD76GSmM9GJB+G9t+ZDpBi4pncB4Q+UDCEdslQpJYls5Q5S
+# UUd0viastkF13nqsX40/ybzTQRESW+UQUOsxxcpyFiIJ33xMdT9j7CFfxCBRa2+x
+# q4aLT8LWRV+dIPyhHsXAj6KxfgommfXkaS+YHS312amyHeUbAgMBAAGjggE6MIIB
+# NjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBTs1+OC0nFdZEzfLmc/57qYrhwP
+# TzAfBgNVHSMEGDAWgBRF66Kv9JLLgjEtUYunpyGd823IDzAOBgNVHQ8BAf8EBAMC
+# AYYweQYIKwYBBQUHAQEEbTBrMCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdp
+# Y2VydC5jb20wQwYIKwYBBQUHMAKGN2h0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNv
+# bS9EaWdpQ2VydEFzc3VyZWRJRFJvb3RDQS5jcnQwRQYDVR0fBD4wPDA6oDigNoY0
+# aHR0cDovL2NybDMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0QXNzdXJlZElEUm9vdENB
+# LmNybDARBgNVHSAECjAIMAYGBFUdIAAwDQYJKoZIhvcNAQEMBQADggEBAHCgv0Nc
+# Vec4X6CjdBs9thbX979XB72arKGHLOyFXqkauyL4hxppVCLtpIh3bb0aFPQTSnov
+# Lbc47/T/gLn4offyct4kvFIDyE7QKt76LVbP+fT3rDB6mouyXtTP0UNEm0Mh65Zy
+# oUi0mcudT6cGAxN3J0TU53/oWajwvy8LpunyNDzs9wPHh6jSTEAZNUZqaVSwuKFW
+# juyk1T3osdz9HNj0d1pcVIxv76FQPfx2CWiEn2/K2yCNNWAcAgPLILCsWKAOQGPF
+# mCLBsln1VWvPJ6tsds5vIy30fnFqI2si/xK4VC0nftg62fC2h5b9W9FcrBjDTZ9z
+# twGpn1eqXijiuZQwgga0MIIEnKADAgECAhANx6xXBf8hmS5AQyIMOkmGMA0GCSqG
+# SIb3DQEBCwUAMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMx
+# GTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lDZXJ0IFRy
+# dXN0ZWQgUm9vdCBHNDAeFw0yNTA1MDcwMDAwMDBaFw0zODAxMTQyMzU5NTlaMGkx
+# CzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4
+# RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYg
+# MjAyNSBDQTEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQC0eDHTCphB
+# cr48RsAcrHXbo0ZodLRRF51NrY0NlLWZloMsVO1DahGPNRcybEKq+RuwOnPhof6p
+# vF4uGjwjqNjfEvUi6wuim5bap+0lgloM2zX4kftn5B1IpYzTqpyFQ/4Bt0mAxAHe
+# HYNnQxqXmRinvuNgxVBdJkf77S2uPoCj7GH8BLuxBG5AvftBdsOECS1UkxBvMgEd
+# gkFiDNYiOTx4OtiFcMSkqTtF2hfQz3zQSku2Ws3IfDReb6e3mmdglTcaarps0wjU
+# jsZvkgFkriK9tUKJm/s80FiocSk1VYLZlDwFt+cVFBURJg6zMUjZa/zbCclF83bR
+# VFLeGkuAhHiGPMvSGmhgaTzVyhYn4p0+8y9oHRaQT/aofEnS5xLrfxnGpTXiUOeS
+# LsJygoLPp66bkDX1ZlAeSpQl92QOMeRxykvq6gbylsXQskBBBnGy3tW/AMOMCZIV
+# NSaz7BX8VtYGqLt9MmeOreGPRdtBx3yGOP+rx3rKWDEJlIqLXvJWnY0v5ydPpOjL
+# 6s36czwzsucuoKs7Yk/ehb//Wx+5kMqIMRvUBDx6z1ev+7psNOdgJMoiwOrUG2Zd
+# SoQbU2rMkpLiQ6bGRinZbI4OLu9BMIFm1UUl9VnePs6BaaeEWvjJSjNm2qA+sdFU
+# eEY0qVjPKOWug/G6X5uAiynM7Bu2ayBjUwIDAQABo4IBXTCCAVkwEgYDVR0TAQH/
+# BAgwBgEB/wIBADAdBgNVHQ4EFgQU729TSunkBnx6yuKQVvYv1Ensy04wHwYDVR0j
+# BBgwFoAU7NfjgtJxXWRM3y5nP+e6mK4cD08wDgYDVR0PAQH/BAQDAgGGMBMGA1Ud
+# JQQMMAoGCCsGAQUFBwMIMHcGCCsGAQUFBwEBBGswaTAkBggrBgEFBQcwAYYYaHR0
+# cDovL29jc3AuZGlnaWNlcnQuY29tMEEGCCsGAQUFBzAChjVodHRwOi8vY2FjZXJ0
+# cy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNydDBDBgNVHR8E
+# PDA6MDigNqA0hjJodHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVz
+# dGVkUm9vdEc0LmNybDAgBgNVHSAEGTAXMAgGBmeBDAEEAjALBglghkgBhv1sBwEw
+# DQYJKoZIhvcNAQELBQADggIBABfO+xaAHP4HPRF2cTC9vgvItTSmf83Qh8WIGjB/
+# T8ObXAZz8OjuhUxjaaFdleMM0lBryPTQM2qEJPe36zwbSI/mS83afsl3YTj+IQhQ
+# E7jU/kXjjytJgnn0hvrV6hqWGd3rLAUt6vJy9lMDPjTLxLgXf9r5nWMQwr8Myb9r
+# EVKChHyfpzee5kH0F8HABBgr0UdqirZ7bowe9Vj2AIMD8liyrukZ2iA/wdG2th9y
+# 1IsA0QF8dTXqvcnTmpfeQh35k5zOCPmSNq1UH410ANVko43+Cdmu4y81hjajV/gx
+# dEkMx1NKU4uHQcKfZxAvBAKqMVuqte69M9J6A47OvgRaPs+2ykgcGV00TYr2Lr3t
+# y9qIijanrUR3anzEwlvzZiiyfTPjLbnFRsjsYg39OlV8cipDoq7+qNNjqFzeGxcy
+# tL5TTLL4ZaoBdqbhOhZ3ZRDUphPvSRmMThi0vw9vODRzW6AxnJll38F0cuJG7uEB
+# YTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/DJbg3s6KCLPAlZ66RzIg9sC+NJpud
+# /v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHbxtl5TPau1j/1MIDpMPx0LckTetiS
+# uEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAPvIXKUjPSxyZsq8WhbaM2tszWkPZP
+# ubdcMIIG6DCCBdCgAwIBAgITVgAAAMVxDkSgwgHrvgAAAAAAxTANBgkqhkiG9w0B
+# AQsFADBIMRUwEwYKCZImiZPyLGQBGRYFbG9jYWwxFzAVBgoJkiaJk/IsZAEZFgdu
+# ZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsMB4XDTI2MDYyNDE2NDYzMVoX
+# DTI2MDcwNzIwMzEwMFowdDEVMBMGCgmSJomT8ixkARkWBWxvY2FsMRcwFQYKCZIm
+# iZPyLGQBGRYHbmV4cG9ydDESMBAGA1UECxMJRGl2aXNpb25zMRowGAYDVQQLExFO
+# ZXhwb3J0IFNvbHV0aW9uczESMBAGA1UEAxMJRGFuIFB1cGVrMIIBIjANBgkqhkiG
+# 9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwneI0MpXdckSOPpsUq7m8qAr22igJfKu+B3K
+# 4KD0+i49WATRD5XXGRqAijtuG+PSQmBPsSlXg737fEz0DZABRcaJn3oKQrzwXDY9
+# GaprmDvALNG8AImTw2irrWIF2sl37TSZF3q5Bs45bR2U5pllJRABUYdbKZ+1Fh5k
+# bm4g4U7zOO0MaVMib6Ye8fSxQQ8+DavbiW07ym1TWTFvcg4Owt7a9NCuHAeHvBDV
+# PnWxrCcirwuAZL2n/JAhRRHpDAMnp0Cq01s9mp1foQAGSfiiJdN2t07QtZxTxpej
+# L5eO2wEUc5+0jzibWkFy5iDXFzEx+UA/S/5twV3KBYDAnUad8QIDAQABo4IDnTCC
+# A5kwPgYJKwYBBAGCNxUHBDEwLwYnKwYBBAGCNxUIhYmHZIX7mUqEuZsthev4V4f8
+# lgOBFYT17Q2G2us2AgFkAgEAMBMGA1UdJQQMMAoGCCsGAQUFBwMDMA4GA1UdDwEB
+# /wQEAwIHgDAbBgkrBgEEAYI3FQoEDjAMMAoGCCsGAQUFBwMDMB0GA1UdDgQWBBRv
+# MnPZAnjFSFHO7U2J/OfFv8AIFjAfBgNVHSMEGDAWgBSn/qota2GbBcXK/qpf0af/
+# GXhapDCBzQYDVR0fBIHFMIHCMIG/oIG8oIG5hoG2bGRhcDovLy9DTj1uZXhwb3J0
+# LWxvY2FsLENOPU9LQ0RDMDIsQ049Q0RQLENOPVB1YmxpYyUyMEtleSUyMFNlcnZp
+# Y2VzLENOPVNlcnZpY2VzLENOPUNvbmZpZ3VyYXRpb24sREM9bmV4cG9ydCxEQz1s
+# b2NhbD9jZXJ0aWZpY2F0ZVJldm9jYXRpb25MaXN0P2Jhc2U/b2JqZWN0Q2xhc3M9
+# Y1JMRGlzdHJpYnV0aW9uUG9pbnQwggF/BggrBgEFBQcBAQSCAXEwggFtMIGuBggr
+# BgEFBQcwAoaBoWxkYXA6Ly8vQ049bmV4cG9ydC1sb2NhbCxDTj1BSUEsQ049UHVi
+# bGljJTIwS2V5JTIwU2VydmljZXMsQ049U2VydmljZXMsQ049Q29uZmlndXJhdGlv
+# bixEQz1uZXhwb3J0LERDPWxvY2FsP2NBQ2VydGlmaWNhdGU/YmFzZT9vYmplY3RD
+# bGFzcz1jZXJ0aWZpY2F0aW9uQXV0aG9yaXR5MFsGCCsGAQUFBzABhk9odHRwOi8v
+# T0tDREMwMi5uZXhwb3J0LmxvY2FsL0NlcnRFbnJvbGwvT0tDREMwMi5uZXhwb3J0
+# LmxvY2FsX25leHBvcnQtbG9jYWwuY3J0MF0GCCsGAQUFBzAChlFmaWxlOi8vLy9P
+# S0NEQzAyLm5leHBvcnQubG9jYWwvQ2VydEVucm9sbC9PS0NEQzAyLm5leHBvcnQu
+# bG9jYWxfbmV4cG9ydC1sb2NhbC5jcnQwMgYDVR0RBCswKaAnBgorBgEEAYI3FAID
+# oBkMF2Rhbi5wdXBla0BuZXhwb3J0LmxvY2FsME4GCSsGAQQBgjcZAgRBMD+gPQYK
+# KwYBBAGCNxkCAaAvBC1TLTEtNS0yMS0xMjU0MzE2MzQwLTI4NjQzMzE5NjgtNDc3
+# OTA1NDQxLTExMDUwDQYJKoZIhvcNAQELBQADggEBAF3a4D/vdL/XqBZ2dtkiUrST
+# sjJZjhuSQhl/yfxn/9CBYM131XTr8Q4eCYWk+Xz8txUFNM4khZ8IWttheF+jiWBn
+# h4ROqtKSGJhgNV5xDgt7MrdBaltNg+kksDUnwR9Pxdzkke3ofQyL4M/TkZvCCUbQ
+# 40eW4qAYhIrRgNBBeK8SC9+VpOtFgcmLbtBDeDNsu5VJXcvm30XhyqBXtSxpTmfm
+# hcWTUlze80WL0orYtP2HZgjvShmjTWrXIt4Jl1TWVobvIs9LJ5h8qdqhUIGhEokb
+# Bazmi//43AK8IZYHIpbR/0GEUF82VYQo6x9LLy/EmwiPw1X/8+X/hrl7+ZD7kXYw
+# ggbtMIIE1aADAgECAhAKgO8YS43xBYLRxHanlXRoMA0GCSqGSIb3DQEBCwUAMGkx
+# CzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4
+# RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYg
+# MjAyNSBDQTEwHhcNMjUwNjA0MDAwMDAwWhcNMzYwOTAzMjM1OTU5WjBjMQswCQYD
+# VQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xOzA5BgNVBAMTMkRpZ2lD
+# ZXJ0IFNIQTI1NiBSU0E0MDk2IFRpbWVzdGFtcCBSZXNwb25kZXIgMjAyNSAxMIIC
+# IjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA0EasLRLGntDqrmBWsytXum9R
+# /4ZwCgHfyjfMGUIwYzKomd8U1nH7C8Dr0cVMF3BsfAFI54um8+dnxk36+jx0Tb+k
+# +87H9WPxNyFPJIDZHhAqlUPt281mHrBbZHqRK71Em3/hCGC5KyyneqiZ7syvFXJ9
+# A72wzHpkBaMUNg7MOLxI6E9RaUueHTQKWXymOtRwJXcrcTTPPT2V1D/+cFllESvi
+# H8YjoPFvZSjKs3SKO1QNUdFd2adw44wDcKgH+JRJE5Qg0NP3yiSyi5MxgU6cehGH
+# r7zou1znOM8odbkqoK+lJ25LCHBSai25CFyD23DZgPfDrJJJK77epTwMP6eKA0kW
+# a3osAe8fcpK40uhktzUd/Yk0xUvhDU6lvJukx7jphx40DQt82yepyekl4i0r8OEp
+# s/FNO4ahfvAk12hE5FVs9HVVWcO5J4dVmVzix4A77p3awLbr89A90/nWGjXMGn7F
+# QhmSlIUDy9Z2hSgctaepZTd0ILIUbWuhKuAeNIeWrzHKYueMJtItnj2Q+aTyLLKL
+# M0MheP/9w6CtjuuVHJOVoIJ/DtpJRE7Ce7vMRHoRon4CWIvuiNN1Lk9Y+xZ66laz
+# s2kKFSTnnkrT3pXWETTJkhd76CIDBbTRofOsNyEhzZtCGmnQigpFHti58CSmvEyJ
+# cAlDVcKacJ+A9/z7eacCAwEAAaOCAZUwggGRMAwGA1UdEwEB/wQCMAAwHQYDVR0O
+# BBYEFOQ7/PIx7f391/ORcWMZUEPPYYzoMB8GA1UdIwQYMBaAFO9vU0rp5AZ8esri
+# kFb2L9RJ7MtOMA4GA1UdDwEB/wQEAwIHgDAWBgNVHSUBAf8EDDAKBggrBgEFBQcD
+# CDCBlQYIKwYBBQUHAQEEgYgwgYUwJAYIKwYBBQUHMAGGGGh0dHA6Ly9vY3NwLmRp
+# Z2ljZXJ0LmNvbTBdBggrBgEFBQcwAoZRaHR0cDovL2NhY2VydHMuZGlnaWNlcnQu
+# Y29tL0RpZ2lDZXJ0VHJ1c3RlZEc0VGltZVN0YW1waW5nUlNBNDA5NlNIQTI1NjIw
+# MjVDQTEuY3J0MF8GA1UdHwRYMFYwVKBSoFCGTmh0dHA6Ly9jcmwzLmRpZ2ljZXJ0
+# LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRpbWVTdGFtcGluZ1JTQTQwOTZTSEEyNTYy
+# MDI1Q0ExLmNybDAgBgNVHSAEGTAXMAgGBmeBDAEEAjALBglghkgBhv1sBwEwDQYJ
+# KoZIhvcNAQELBQADggIBAGUqrfEcJwS5rmBB7NEIRJ5jQHIh+OT2Ik/bNYulCrVv
+# hREafBYF0RkP2AGr181o2YWPoSHz9iZEN/FPsLSTwVQWo2H62yGBvg7ouCODwrx6
+# ULj6hYKqdT8wv2UV+Kbz/3ImZlJ7YXwBD9R0oU62PtgxOao872bOySCILdBghQ/Z
+# LcdC8cbUUO75ZSpbh1oipOhcUT8lD8QAGB9lctZTTOJM3pHfKBAEcxQFoHlt2s9s
+# XoxFizTeHihsQyfFg5fxUFEp7W42fNBVN4ueLaceRf9Cq9ec1v5iQMWTFQa0xNqI
+# tH3CPFTG7aEQJmmrJTV3Qhtfparz+BW60OiMEgV5GWoBy4RVPRwqxv7Mk0Sy4QHs
+# 7v9y69NBqycz0BZwhB9WOfOu/CIJnzkQTwtSSpGGhLdjnQ4eBpjtP+XB3pQCtv4E
+# 5UCSDag6+iX8MmB10nfldPF9SVD7weCC3yXZi/uuhqdwkgVxuiMFzGVFwYbQsiGn
+# oa9F5AaAyBjFBtXVLcKtapnMG3VH3EmAp/jsJ3FVF3+d1SVDTmjFjLbNFZUWMXuZ
+# yvgLfgyPehwJVxwC+UpX2MSey2ueIu9THFVkT+um1vshETaWyQo8gmBto/m3acaP
+# 9QsuLj3FNwFlTxq25+T4QwX9xa6ILs84ZPvmpovq90K8eWyG2N01c4IhSOxqt81n
+# MYIFOzCCBTcCAQEwXzBIMRUwEwYKCZImiZPyLGQBGRYFbG9jYWwxFzAVBgoJkiaJ
+# k/IsZAEZFgduZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsAhNWAAAAxXEO
+# RKDCAeu+AAAAAADFMA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcCAQwxCjAI
+# oAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIB
+# CzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIJsEfQNXRhIqam6SYR+i
+# w1d97YxCvbSvv+s5/hRrx3dkMA0GCSqGSIb3DQEBAQUABIIBAAYgeztdmlsBiRlP
+# fIxiHsqn0wUYkPJKjeRL19peLgjl7/rC3QnYbsKpiFj5nGo0opDJTZaxC28IPYOR
+# H7SZs6Ehqxgtas7QHFaF7nES48ML2g5Jku/Jse5bumIxIvPHKcFe0eRxj8rJeRMM
+# GKDGGOp/M1l9LYB2M62abc/KWfTkRPiCmE7/GVvZyKGoh7Io6l/ZvGqkNmu/3cqX
+# iygmNmGchGJBJquJyffAa3Wa8fJv/im910sx2ab1nVN2EQM1mvdKQODgOdoi3ARR
+# 5/J67ozXbX2TB4VTbh7oGaCCI7dAow5xbncQbCkgzzG49lhocFHIXEGiY59Utup1
+# OlV6gP2hggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQswCQYDVQQG
+# EwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERpZ2lDZXJ0
+# IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIwMjUgQ0Ex
+# AhAKgO8YS43xBYLRxHanlXRoMA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZIhvcNAQkD
+# MQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwNjI5MTQ1MDI1WjAvBgkq
+# hkiG9w0BCQQxIgQgBeZgUZ3LhIF2RVrjga0Z+Qhk/Yvapzv6EbsGOQD1oXwwDQYJ
+# KoZIhvcNAQEBBQAEggIAXa/ltKHdf+uw6S9lMOeLOlwU/D9M8IxVh8Rk/XP1mMfA
+# TWu8LHtCBVv1PEkNB5a+kH9t2q3PevssSoUtopltGkFBBUnXHPubJn5MoMvriNe8
+# tumMcTb6/4Dos56Js9gy8AYuqlkqLeDLrlzAdOb17MW6ClEXuq+oK9Fxg1BN31pc
+# gE2wKTeJV4xyIS3lo+XybjAnuLnvSK19BUOPgH5UDzdaG1v76iLiBnhHIl3Mvus2
+# rcXYaXTJTXYb163rUpsCqjd5y4STfc3cwJyeGCj1XWhRXAN8UgE+Ba9vCJiKkf/l
+# guwojvOY11fPTCkw8BW1N6U8m0TzWR96b/cm4nTXGPUnj43VBiB5USPMy44wwUCC
+# Z147RaqathmfLHHaLz+Rz0y8ynen2i0YmxqPG0oZ49Q4jAHrVh8NJihPe669cKFx
+# Ssc68BOoCpN1aSEbhLhqMrwmHfjV2heFZzCk4KgAHbrV3TH1G5BpMlH+WYBk2gnI
+# g/ET8mp0NtpCzQQYuNZleGnzmm+22st31M5A8OyN6tjg0D8YIvckpKdQ/Sgp1n0U
+# f1n9gHU7DDUSQlOrenVH1uev0ed0jd8qALCbcYpBnrcN+X24u2fnkkuGbVj69T1g
+# Ou2gd+G3GWLnURvK6Szkqrv6KKzTc+gv/k6LmspEIL9EHhiiEBiCtvtrvHoCOrg=
+# SIG # End signature block
