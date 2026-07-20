@@ -3,7 +3,21 @@
   "includeUnknown": true,
   "allowedPackageIds": [],
   "blockedPackageIds": [],
+  "packageRules": [
+    {
+      "id": "OpenJS.NodeJS",
+      "mode": "ManualOnly",
+      "allowMajorVersion": false,
+      "processNames": [
+        "node.exe"
+      ]
+    }
+  ],
   "maxRetries": 2,
+  "retryableInstallerExitCodes": [
+    1618
+  ],
+  "maxRunMinutes": 120,
   "maintenanceWindow": {
     "enabled": false,
     "start": "02:00",

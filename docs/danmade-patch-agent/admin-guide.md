@@ -43,6 +43,10 @@ Default behavior:
 - No allow list.
 - No block list.
 - Maximum two retries after the first attempt.
+- Only MSI exit codes listed in `retryableInstallerExitCodes` are retried; `1603` is recorded for review instead of retried blindly.
+- Major-version upgrades are deferred by default. Use a package rule with `allowMajorVersion: true` only after package-specific validation.
+- Each mode writes its read-only Winget upgrade inventory under `Inventory\` so differences between SYSTEM and logged-on-user views can be investigated.
+- Each run has a bounded `maxRunMinutes` deadline. Winget child-process timeouts are clamped to the remaining run time.
 - No maintenance window restriction.
 - Reboots are reported only.
 - Event Log and JSONL reporting enabled.
@@ -56,6 +60,31 @@ Copy `windows-update-scripts/danmade-patch-agent.policy.sample.json` to:
 ```
 
 Then edit package allow/block lists and maintenance window values for the OU being targeted.
+
+### Package Rules
+
+Use `packageRules` for packages that need a stricter change path than ordinary unattended patching:
+
+```json
+"packageRules": [
+  {
+    "id": "OpenJS.NodeJS",
+    "mode": "ManualOnly",
+    "allowMajorVersion": false,
+    "processNames": ["node.exe"]
+  }
+]
+```
+
+- `Auto`: eligible for unattended patching, subject to the major-version gate.
+- `ManualOnly`: records `DeferredManualOnly` without launching an installer.
+- `QuiescenceRequired`: records `DeferredProcessInUse` while any configured process is running; it never terminates those processes.
+
+The agent records `DeferredMajorVersion` when the first numeric version component changes. This is the default for all packages. A package rule must explicitly set `allowMajorVersion` to `true` to permit an unattended major upgrade.
+
+Use `retryableInstallerExitCodes` only for known transient installer results, such as `1618` when another installation is in progress. Do not add generic fatal result `1603` without package-specific evidence.
+
+The agent verifies a completed upgrade by running a complete read-only `winget upgrade --output json` inventory refresh and searching for the package ID. It must never use `winget upgrade --id <id>` as a verification query because that command launches an installer.
 
 ## Signing With The Domain CA
 

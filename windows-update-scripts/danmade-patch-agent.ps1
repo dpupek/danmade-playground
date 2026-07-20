@@ -44,6 +44,7 @@ $script:Policy = $null
 $script:JsonlPath = $null
 $script:WingetCommand = $null
 $script:CachedUninstallEntries = $null
+$script:RunDeadline = $null
 
 function New-DefaultPolicy {
   [pscustomobject]@{
@@ -51,7 +52,10 @@ function New-DefaultPolicy {
     includeUnknown    = $true
     allowedPackageIds = @()
     blockedPackageIds = @()
+    packageRules      = @()
     maxRetries        = 2
+    retryableInstallerExitCodes = @(1618)
+    maxRunMinutes     = 120
     maintenanceWindow = [pscustomobject]@{
       enabled = $false
       start   = '02:00'
@@ -94,6 +98,39 @@ function Convert-ToStringArray {
   )
 }
 
+function Convert-ToIntArray {
+  param([object]$Value)
+
+  if ($null -eq $Value) { return @() }
+  return @(
+    foreach ($item in @($Value)) {
+      try { [int]$item } catch { }
+    }
+  )
+}
+
+function Convert-ToPackageRules {
+  param([object]$Value)
+
+  if ($null -eq $Value) { return @() }
+  return @(
+    foreach ($rule in @($Value)) {
+      $id = [string](Get-PropertyValue -Object $rule -Name 'id' -Default '')
+      if ([string]::IsNullOrWhiteSpace($id)) { continue }
+
+      $mode = [string](Get-PropertyValue -Object $rule -Name 'mode' -Default 'Auto')
+      if ($mode -notin @('Auto', 'ManualOnly', 'QuiescenceRequired')) { $mode = 'Auto' }
+
+      [pscustomobject]@{
+        id                = $id.Trim()
+        mode              = $mode
+        allowMajorVersion = [bool](Get-PropertyValue -Object $rule -Name 'allowMajorVersion' -Default $false)
+        processNames      = Convert-ToStringArray -Value (Get-PropertyValue -Object $rule -Name 'processNames' -Default @())
+      }
+    }
+  )
+}
+
 function Merge-Policy {
   param([object]$LoadedPolicy)
 
@@ -110,12 +147,19 @@ function Merge-Policy {
   $retention = [int](Get-PropertyValue -Object $LoadedPolicy -Name 'logRetentionDays' -Default $default.logRetentionDays)
   if ($retention -lt 1) { $retention = 1 }
 
+  $maxRunMinutes = [int](Get-PropertyValue -Object $LoadedPolicy -Name 'maxRunMinutes' -Default $default.maxRunMinutes)
+  if ($maxRunMinutes -lt 15) { $maxRunMinutes = 15 }
+  if ($maxRunMinutes -gt 240) { $maxRunMinutes = 240 }
+
   return [pscustomobject]@{
     enabled           = [bool](Get-PropertyValue -Object $LoadedPolicy -Name 'enabled' -Default $default.enabled)
     includeUnknown    = [bool](Get-PropertyValue -Object $LoadedPolicy -Name 'includeUnknown' -Default $default.includeUnknown)
     allowedPackageIds = Convert-ToStringArray -Value (Get-PropertyValue -Object $LoadedPolicy -Name 'allowedPackageIds' -Default @())
     blockedPackageIds = Convert-ToStringArray -Value (Get-PropertyValue -Object $LoadedPolicy -Name 'blockedPackageIds' -Default @())
+    packageRules      = Convert-ToPackageRules -Value (Get-PropertyValue -Object $LoadedPolicy -Name 'packageRules' -Default @())
     maxRetries        = $maxRetries
+    retryableInstallerExitCodes = Convert-ToIntArray -Value (Get-PropertyValue -Object $LoadedPolicy -Name 'retryableInstallerExitCodes' -Default $default.retryableInstallerExitCodes)
+    maxRunMinutes     = $maxRunMinutes
     maintenanceWindow = [pscustomobject]@{
       enabled = [bool](Get-PropertyValue -Object $maintenance -Name 'enabled' -Default $default.maintenanceWindow.enabled)
       start   = [string](Get-PropertyValue -Object $maintenance -Name 'start' -Default $default.maintenanceWindow.start)
@@ -169,6 +213,11 @@ function Get-WingetScopeArgument {
   return 'machine'
 }
 
+function Get-RemainingRunSeconds {
+  if ($null -eq $script:RunDeadline) { return $null }
+  return [math]::Floor(($script:RunDeadline - (Get-Date)).TotalSeconds)
+}
+
 function Join-ProcessArguments {
   param([string[]]$Arguments)
 
@@ -194,6 +243,19 @@ function Invoke-WingetProcess {
   $stdoutPath = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("danmade-winget-{0}.out" -f ([guid]::NewGuid()))
   $stderrPath = Join-Path -Path ([IO.Path]::GetTempPath()) -ChildPath ("danmade-winget-{0}.err" -f ([guid]::NewGuid()))
   $argumentList = Join-ProcessArguments -Arguments $Arguments
+
+  $remainingSeconds = Get-RemainingRunSeconds
+  if ($null -ne $remainingSeconds -and $remainingSeconds -le 0) {
+    return [pscustomobject]@{
+      ExitCode = -1
+      TimedOut = $true
+      StdOut   = ''
+      StdErr   = 'Agent run deadline exceeded before winget could start.'
+    }
+  }
+  if ($null -ne $remainingSeconds) {
+    $TimeoutSeconds = [math]::Min($TimeoutSeconds, [math]::Max(1, [int]$remainingSeconds))
+  }
 
   try {
     # Child winget console processes must not flash in the interactive user task.
@@ -245,7 +307,22 @@ function Initialize-AgentStorage {
   Ensure-Directory -Path (Join-Path -Path $LogRoot -ChildPath 'Logs')
   Ensure-Directory -Path (Join-Path -Path $LogRoot -ChildPath 'Events')
   Ensure-Directory -Path (Join-Path -Path $LogRoot -ChildPath 'State')
+  Ensure-Directory -Path (Join-Path -Path $LogRoot -ChildPath 'Inventory')
   $script:JsonlPath = Join-Path -Path $LogRoot -ChildPath 'Events\patch-agent.jsonl'
+}
+
+function Write-WingetInventorySnapshot {
+  param([object[]]$Packages)
+
+  if ($WhatIfPreference) { return }
+  $snapshotPath = Join-Path -Path $LogRoot -ChildPath ("Inventory\winget-upgrades-{0}.json" -f $Mode.ToLowerInvariant())
+  [ordered]@{
+    schemaVersion = '1.0'
+    timestamp     = (Get-Date).ToString('o')
+    computerName  = $env:COMPUTERNAME
+    mode          = $Mode
+    packages      = @($Packages | Select-Object Name,Id,Installed,Available,Source,InstallScope)
+  } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $snapshotPath -Encoding UTF8
 }
 
 function Get-NotificationStatePath {
@@ -709,6 +786,8 @@ function Add-WingetJsonPackages {
 }
 
 function Get-WingetUpgradeList {
+  param([switch]$FailOnError)
+
   $baseArgs = @('upgrade', '--disable-interactivity', '--accept-source-agreements')
   if ($script:Policy.includeUnknown) { $baseArgs += '--include-unknown' }
 
@@ -753,6 +832,11 @@ function Get-WingetUpgradeList {
         wingetExitCode    = $tableResult.ExitCode
         wingetExitCodeHex = Convert-ToHexCode -Code $tableResult.ExitCode
       } | Out-Null
+      if ($FailOnError) { throw 'winget upgrade list timed out' }
+      return @()
+    }
+    if ([int]$tableResult.ExitCode -ne 0) {
+      if ($FailOnError) { throw "winget upgrade list failed with exit code $($tableResult.ExitCode)" }
       return @()
     }
     $output = $tableResult.StdOut
@@ -775,9 +859,57 @@ function Get-WingetUpgradeList {
       }
     )
   } catch {
+    if ($FailOnError) { throw }
     Write-Verbose "winget table upgrade listing failed. $($_.Exception.Message)"
     return @()
   }
+}
+
+function Get-PackageRule {
+  param([string]$PackageId)
+
+  foreach ($rule in @($script:Policy.packageRules)) {
+    if ([string]::Equals([string]$rule.id, $PackageId, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return $rule
+    }
+  }
+  return $null
+}
+
+function Get-PackageMajorVersion {
+  param([string]$Version)
+
+  $match = [regex]::Match([string]$Version, '(?<!\d)(\d+)')
+  if (-not $match.Success) { return $null }
+  return [int]$match.Groups[1].Value
+}
+
+function Test-PackageMajorUpgrade {
+  param([object]$Package)
+
+  $installedMajor = Get-PackageMajorVersion -Version ([string]$Package.Installed)
+  $availableMajor = Get-PackageMajorVersion -Version ([string]$Package.Available)
+  return ($null -ne $installedMajor -and $null -ne $availableMajor -and $installedMajor -ne $availableMajor)
+}
+
+function Get-RunningRuleProcesses {
+  param([object]$Rule)
+
+  if ($null -eq $Rule -or @($Rule.processNames).Count -eq 0) { return @() }
+  $names = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($name in @($Rule.processNames)) {
+    $trimmed = ([string]$name).Trim()
+    if ($trimmed.EndsWith('.exe', [System.StringComparison]::OrdinalIgnoreCase)) { $trimmed = $trimmed.Substring(0, $trimmed.Length - 4) }
+    if ($trimmed) { [void]$names.Add($trimmed) }
+  }
+  return @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $names.Contains($_.ProcessName) })
+}
+
+function Test-RetryableInstallerExitCode {
+  param([Nullable[int]]$InstallerExitCode)
+
+  if ($null -eq $InstallerExitCode) { return $false }
+  return @($script:Policy.retryableInstallerExitCodes) -contains [int]$InstallerExitCode
 }
 
 function Select-PolicyPackages {
@@ -806,23 +938,59 @@ function Select-PolicyPackages {
         } | Out-Null
         continue
       }
+      $rule = Get-PackageRule -PackageId ([string]$pkg.Id)
+      if ($rule -and $rule.mode -eq 'ManualOnly') {
+        Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
+          packageId = [string]$pkg.Id
+          status    = 'DeferredManualOnly'
+        } | Out-Null
+        continue
+      }
+
+      $allowMajorVersion = if ($rule) { [bool]$rule.allowMajorVersion } else { $false }
+      if ((Test-PackageMajorUpgrade -Package $pkg) -and -not $allowMajorVersion) {
+        Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
+          packageId = [string]$pkg.Id
+          status    = 'DeferredMajorVersion'
+          installedVersion = [string]$pkg.Installed
+          availableVersion = [string]$pkg.Available
+        } | Out-Null
+        continue
+      }
+
+      if ($rule -and $rule.mode -eq 'QuiescenceRequired') {
+        $runningProcesses = @(Get-RunningRuleProcesses -Rule $rule)
+        if ($runningProcesses.Count -gt 0) {
+          Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
+            packageId = [string]$pkg.Id
+            status    = 'DeferredProcessInUse'
+            processCount = $runningProcesses.Count
+            processNames = @($runningProcesses | Select-Object -ExpandProperty ProcessName -Unique)
+          } | Out-Null
+          continue
+        }
+      }
+
       $scope = if ($pkg.PSObject.Properties['InstallScope']) { [string]$pkg.InstallScope } else { 'Unknown' }
       if ($Mode -eq 'User' -and $scope -ne 'User') {
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
-          status    = 'SkippedScope'
+          status    = 'InventoryScopeMismatch'
           installScope = $scope
+          expectedScope = 'User'
         } | Out-Null
         continue
       }
       if ($Mode -eq 'Machine' -and $scope -eq 'User') {
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
-          status    = 'SkippedScope'
+          status    = 'InventoryScopeMismatch'
           installScope = $scope
+          expectedScope = 'Machine'
         } | Out-Null
         continue
       }
+
       $pkg
     }
   )
@@ -835,7 +1003,7 @@ function Get-InstallerExitCodeFromLog {
   try {
     $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
     $patterns = @(
-      '(?i)(?:install|uninstall)\s+failed\s+with\s+exit\s+code:\s*(-?\d+)',
+      '(?i)(?:install|installer|uninstall)\s+failed\s+with\s+exit\s+code:\s*(-?\d+)',
       '(?i)installer\s+return\s+code\s*[:=]\s*(-?\d+)',
       '(?i)msi(?:\s+installer)?\s+(?:return|exit)\s+code\s*[:=]\s*(-?\d+)',
       '(?i)returned\s+actual\s+error\s+code\s+(-?\d+)',
@@ -857,74 +1025,31 @@ function Get-InstallerExitCodeFromLog {
 function Test-WingetPackageStillOffered {
   param([object]$Package)
 
-  $args = @(
-    'upgrade',
-    '--id', [string]$Package.Id,
-    '--exact',
-    '--disable-interactivity',
-    '--accept-source-agreements',
-    '--scope', (Get-WingetScopeArgument)
-  )
-  if ($script:Policy.includeUnknown) { $args += '--include-unknown' }
-  if ($Package.Source) { $args += @('--source', [string]$Package.Source) }
-
-  $result = Invoke-WingetProcess -Arguments $args -TimeoutSeconds 180
-  $exitCode = [int]$result.ExitCode
-  if ($result.TimedOut) {
-    return [pscustomobject]@{
-      Status            = 'VerificationInconclusive'
-      StillOffered      = $false
-      TimedOut          = $true
-      WingetExitCode    = $exitCode
-      WingetExitCodeHex = Convert-ToHexCode -Code $exitCode
-    }
-  }
-
-  if ($exitCode -ne 0) {
+  # `winget upgrade --id` executes an installer. Re-list the complete inventory instead.
+  try {
+    $availablePackages = @(Get-WingetUpgradeList -FailOnError)
+  } catch {
     return [pscustomobject]@{
       Status            = 'VerificationInconclusive'
       StillOffered      = $false
       TimedOut          = $false
-      WingetExitCode    = $exitCode
-      WingetExitCodeHex = Convert-ToHexCode -Code $exitCode
+      WingetExitCode    = -1
+      WingetExitCodeHex = Convert-ToHexCode -Code -1
     }
   }
 
   $packageId = [string]$Package.Id
-  $stillOffered = $false
-  $stdout = [string]$result.StdOut
-  if ($stdout) {
-    $jsonText = $stdout.Trim()
-    $firstJsonIndex = $jsonText.IndexOfAny(@('[', '{'))
-    if ($firstJsonIndex -ge 0) {
-      try {
-        $data = $jsonText.Substring($firstJsonIndex) | ConvertFrom-Json -ErrorAction Stop
-        $collected = New-Object System.Collections.Generic.List[object]
-        Add-WingetJsonPackages -Node $data -Collector $collected -InheritedSource $null
-        $stillOffered = @($collected | Where-Object { $_.Id -and [string]::Equals([string]$_.Id, $packageId, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
-      } catch {
-        $stillOffered = $false
-      }
-    }
-
-    if (-not $stillOffered) {
-      foreach ($line in @($stdout -split "`r`n|`n|`r")) {
-        $pkg = ConvertFrom-WingetUpgradeTableRow -Line $line
-        if ($pkg -and [string]::Equals([string]$pkg.Id, $packageId, [System.StringComparison]::OrdinalIgnoreCase)) {
-          $stillOffered = $true
-          break
-        }
-      }
-    }
-  }
+  $stillOffered = @($availablePackages | Where-Object {
+    $_.Id -and [string]::Equals([string]$_.Id, $packageId, [System.StringComparison]::OrdinalIgnoreCase)
+  }).Count -gt 0
 
   if ($stillOffered) {
     return [pscustomobject]@{
       Status            = 'VerificationFailedStillOffered'
       StillOffered      = $true
       TimedOut          = $false
-      WingetExitCode    = $exitCode
-      WingetExitCodeHex = Convert-ToHexCode -Code $exitCode
+      WingetExitCode    = 0
+      WingetExitCodeHex = Convert-ToHexCode -Code 0
     }
   }
 
@@ -932,8 +1057,8 @@ function Test-WingetPackageStillOffered {
     Status            = 'VerifiedNotOffered'
     StillOffered      = $false
     TimedOut          = $false
-    WingetExitCode    = $exitCode
-    WingetExitCodeHex = Convert-ToHexCode -Code $exitCode
+    WingetExitCode    = 0
+    WingetExitCodeHex = Convert-ToHexCode -Code 0
   }
 }
 
@@ -1127,7 +1252,7 @@ function Invoke-PackageUpgrade {
     }
 
     if ($null -ne $installerExitCode -and $installerExitCode -ne 0) {
-      if ($attempt -lt $maxAttempts) {
+      if ($attempt -lt $maxAttempts -and (Test-RetryableInstallerExitCode -InstallerExitCode $installerExitCode)) {
         $recoveryActions.Add('retryInstallerFailure')
         Write-AgentEvent -EventId 5200 -EntryType Warning -Fields @{
           packageId         = [string]$Package.Id
@@ -1145,6 +1270,7 @@ function Invoke-PackageUpgrade {
       Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{
         packageId         = [string]$Package.Id
         status            = 'Failed'
+        failureReason     = if ($installerExitCode -eq 1603) { 'InstallerFatalNoRetry' } else { 'InstallerExitCodeNotRetryable' }
         wingetExitCode    = $wingetExitCode
         wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
         installerExitCode = $installerExitCode
@@ -1218,6 +1344,7 @@ function Invoke-PackageUpgrade {
 $script:PolicyLoadError = $null
 $script:EventLogUnavailable = $null
 $script:Policy = Import-AgentPolicy
+$script:RunDeadline = (Get-Date).AddMinutes([int]$script:Policy.maxRunMinutes)
 
 try {
   Initialize-AgentStorage
@@ -1268,6 +1395,7 @@ try {
   }
 
   $availablePackages = @(Get-WingetUpgradeList)
+  Write-WingetInventorySnapshot -Packages $availablePackages
   $selectedPackages = @(Select-PolicyPackages -Packages $availablePackages)
 
   if ($selectedPackages.Count -eq 0) {
@@ -1328,8 +1456,8 @@ try {
 # SIG # Begin signature block
 # MIIgEQYJKoZIhvcNAQcCoIIgAjCCH/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCH44Y53X2Z/QKZ
-# b7HuKarlLTaHGictXHVjHLovzCU0XKCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCprlyeRWgS/g9z
+# WrKhVV8cWwBznM+0KuG9kfq+tMbGWaCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -1473,29 +1601,29 @@ try {
 # BgoJkiaJk/IsZAEZFgduZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsAhNW
 # AAAA+7iPxuX14sCEAAEAAAD7MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcC
 # AQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYB
-# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIP2xsC7AbRXz
-# oqu3RrmRVi9VltfrUe1a7yqqHWwrUYkJMA0GCSqGSIb3DQEBAQUABIIBAEm5vGPK
-# QToHrUo5EOPHnNqg0uWAH7Y/JKEjBa6s87oAMstjaHXIHYUl7mWFeLe9wSfW+TaK
-# XF+LDtkzPepnpVc9KvX/tI31zgrhy+LyeSxg6Wix7YpnjZfd14KlySqCxTWyprKX
-# epJJZIa1F2Zjd800xztbedxcPjrh5MH95/8ALwcc5N5xPhLaM+nCPO1+y44aGjrF
-# llW3R18EFwsK+lzjCmnUGZIEguXu33bVVcZo4lS4XbpkBMqwQPYIGWRBHx/VS5+I
-# AkN09fIYoDjpiu96vFLY2t/Bff0MrogPmAdxDeiA73KBlA+/Cwj04MZ/cs8+qDkj
-# K+4bAAYhSsGkCqShggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
+# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEINGx2RhqLSlC
+# iy5/bkELxEOYiAdbkBY6STc+QyismOgOMA0GCSqGSIb3DQEBAQUABIIBADcXg159
+# 72BRn+bBtuk8aN9ACEONnm3IU+YH6OLusZ3UNTOCaRddxbbyAEXyA8jW3NOR/F4r
+# ugn5P85RqKF1mCwSNAU4aEyIWiByWQ80se9VYr43N1MtBVbRTKR/TfEMKEaM/QSf
+# xCa2qX636RHM27Ky4UWGfOY8QImMu8q89xuTaiMmiIATDdIBF9d3RcEI7rZrViAc
+# EnN5GfggpjtyzmanrZTFm8JTgjJiNduy9aXaL69g1ohEeKQ9jC+DOHNcDSj6EGsM
+# BgBvquyZstpoGNnOZ15VAvB9G8gwpEJZ88S7deH2m+yG7H9nCEEEfsw/TZVEkzW+
+# 31FliWCJ3oez7WyhggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
 # CQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERp
 # Z2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIw
 # MjUgQ0ExAhAKgO8YS43xBYLRxHanlXRoMA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZI
-# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwNzEwMTI0NzAw
-# WjAvBgkqhkiG9w0BCQQxIgQg1cKHYli6pcJZTbUartBtqjxS7G6l0DWH06CJp315
-# 3KcwDQYJKoZIhvcNAQEBBQAEggIAED7gkkkFxkxEF1KygCHdisZF/T8WxyHvsvs6
-# gXGrjSEA2QRSHpfHshg/gkRxai0nJ/2PmCNYh40Ekjb+Hb+uF2l2Gda1Ho57GopH
-# sc+tB2qh8HVzujKV+ZhBRJi2eLxkHnmhPT/dMPPXPgIFuFSc4x2tSRpW6Tce/kV4
-# VuPo9rY6C/L7thRYMdcS6zdP3ykGJl6XOt+u/nVbYr4tYPmu3/3tSwZtB15zPNC1
-# bo4YS1jO4O+hNKD36ZRoCzlGoF9Jg69/VvwB8rzDy5MJZoAdYbJ1z6B2eKCVTp0d
-# NzHkYy4tsiE6Y1KJ2Q1q4e8PTG7hP8IHjGq6y2Ka5w6/ltbKoq5OJQCb69rglPJw
-# vUdd/VvVIUtXP7nkf6KkNc2H3QOCfcgqQD4WXsrOyuFxluaLvgicz8pbzd1ixY1o
-# yblXBReQFC52WfdTlVqrlqLFCRpu0BVjVIrYoOQU8o51/bDUClVrRrnSGjeIR0Xg
-# gS0dWGz24AB1x8mRqDLc2hmVizr1ZJZNCuyY3yrxfPt4C8JsbX7XkPkPWjSZMw4A
-# nACngpynRv1YimcYgYQWcOj3amKjr2p0SircrUUxvXvPKO4jBR4x0M1yYaUESs5J
-# STSN8jR0U9uygfCSJt/KdgZMp4m77wqcTeh6m5utRCnMPnqdcIh/YJI8pqWQt0UT
-# OUiNoYY=
+# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwNzIwMTg1ODQw
+# WjAvBgkqhkiG9w0BCQQxIgQgHUoCjRIjBqi+46bHDRtq1aDN1egAAU6/2VAqFAxQ
+# aRUwDQYJKoZIhvcNAQEBBQAEggIAH6MzW+0t9d3P50OTlwqe310SeUoFj4zUwO04
+# GLjWSjAejgpDr0g2z2RJQQObnlK+Rz1x/JVHaVaSQMef6sii10JsDICLsf831MpR
+# ZRXi9oDnxed7e+oJLqariGDFtu99kq0uSuq1RhqxBwXM2ZDDciP1tP/3A+oa9yeW
+# ASrAN+mcxgUsr2UVX5vY64bv6tAf43axvekpt+/5yjW8J1NXL2frvgs0fspktPBx
+# WG6SuJect/5DtB/qCC4XW3jhKF074cH65JKR+tEWDLEhjaCvIucLBtGFofsCKTj1
+# l5qb3nXjn8nO+fB7lsqOwe9KZy9pL3OkbffsY0MMBSXhPQ2ra167mk6hlsUuR8HN
+# Clld4SEogsHgF+VLtPgvF4z7H7O4IloYhpgi9+GKKXIej1EKOEcGype/BBt6vq3B
+# ICe4ngR9GUKWvQEUimIkMg9lEMbB2dpTYeUfRfDktnalJrjVuWqJ4DPqHdfluJRf
+# 12H/48PdrQ7qx46FaEdWuIR+VxmmNH8JipXbknlW+v5ghJhZxmBdB7fJ1facIN2c
+# Qzcs4QxheZdcU5bVfZMUQF5zRqo7P7NSHJJmTavXGerH4Q83p750JLfJw9yWtLf/
+# 0pmJXh2LRU4qT+73MUgezuO0REzo/al4eLZtP7xWwl/otuz2lI7EdFR2XOQ6y7x6
+# ARrM7A8=
 # SIG # End signature block
