@@ -121,11 +121,15 @@ function Convert-ToPackageRules {
       $mode = [string](Get-PropertyValue -Object $rule -Name 'mode' -Default 'Auto')
       if ($mode -notin @('Auto', 'ManualOnly', 'QuiescenceRequired')) { $mode = 'Auto' }
 
+      $installerType = ([string](Get-PropertyValue -Object $rule -Name 'installerType' -Default '')).Trim().ToLowerInvariant()
+      if ($installerType -and $installerType -notin @('wix', 'msi', 'msix', 'exe', 'inno', 'nullsoft', 'burn')) { $installerType = '' }
+
       [pscustomobject]@{
         id                = $id.Trim()
         mode              = $mode
         allowMajorVersion = [bool](Get-PropertyValue -Object $rule -Name 'allowMajorVersion' -Default $false)
         processNames      = Convert-ToStringArray -Value (Get-PropertyValue -Object $rule -Name 'processNames' -Default @())
+        installerType     = $installerType
       }
     }
   )
@@ -327,6 +331,130 @@ function Write-WingetInventorySnapshot {
 
 function Get-NotificationStatePath {
   return (Join-Path -Path $LogRoot -ChildPath 'State\pending-notification.json')
+}
+
+function Get-RestartVerificationStatePath {
+  return (Join-Path -Path $LogRoot -ChildPath 'State\pending-restart-verification.json')
+}
+
+function Get-SystemBootTime {
+  try { return (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { return $null }
+}
+
+function Get-RebootMarkerSnapshot {
+  $pendingRename = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+  [pscustomobject]@{
+    cbsRebootPending          = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    windowsUpdateRebootPending = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    pendingFileRenameCount    = @($pendingRename.PendingFileRenameOperations).Count
+    bootTime                  = Get-SystemBootTime
+  }
+}
+
+function Test-NewRebootMarker {
+  param([object]$Before, [object]$After)
+
+  if ($null -eq $Before -or $null -eq $After) { return $false }
+  return (
+    ((-not [bool]$Before.cbsRebootPending) -and [bool]$After.cbsRebootPending) -or
+    ((-not [bool]$Before.windowsUpdateRebootPending) -and [bool]$After.windowsUpdateRebootPending) -or
+    ([int]$After.pendingFileRenameCount -gt [int]$Before.pendingFileRenameCount)
+  )
+}
+
+function Get-PackageAttemptEvidencePath {
+  param([object]$Package)
+  $safeId = ([string]$Package.Id -replace '[^A-Za-z0-9._-]', '_')
+  return (Join-Path -Path (Join-Path -Path $LogRoot -ChildPath 'Logs') -ChildPath ("{0}-{1}.attempt.json" -f $safeId, (Get-Date -Format 'yyyyMMdd-HHmmss')))
+}
+
+function Write-PackageAttemptEvidence {
+  param(
+    [object]$Package,
+    [object]$UpgradeResult,
+    [Nullable[int]]$InstallerExitCode,
+    [object]$RebootBefore,
+    [object]$RebootAfter,
+    [string]$InstallerType,
+    [string]$EvidencePath
+  )
+
+  if ($WhatIfPreference) { return }
+  [ordered]@{
+    schemaVersion      = '1.0'
+    timestamp          = (Get-Date).ToString('o')
+    computerName       = $env:COMPUTERNAME
+    runId              = $script:RunId
+    mode               = $Mode
+    package            = [ordered]@{ id = [string]$Package.Id; name = [string]$Package.Name; installed = [string]$Package.Installed; available = [string]$Package.Available; source = [string]$Package.Source }
+    installerType      = $InstallerType
+    wingetExitCode     = [int]$UpgradeResult.ExitCode
+    timedOut           = [bool]$UpgradeResult.TimedOut
+    installerExitCode  = $InstallerExitCode
+    rebootBefore       = $RebootBefore
+    rebootAfter        = $RebootAfter
+    stdout             = [string]$UpgradeResult.StdOut
+    stderr             = [string]$UpgradeResult.StdErr
+  } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $EvidencePath -Encoding UTF8
+}
+
+function Add-PendingRestartVerification {
+  param([object]$Package, [string]$EvidencePath, [string]$Reason)
+
+  $statePath = Get-RestartVerificationStatePath
+  $existing = @()
+  if (Test-Path -LiteralPath $statePath) {
+    try {
+      $existingState = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+      $existing = @($existingState.packages)
+    } catch { $existing = @() }
+  }
+  $remaining = @($existing | Where-Object { -not [string]::Equals([string]$_.id, [string]$Package.Id, [System.StringComparison]::OrdinalIgnoreCase) })
+  $remaining += [pscustomobject]@{ id = [string]$Package.Id; name = [string]$Package.Name; source = [string]$Package.Source; installed = [string]$Package.Installed; available = [string]$Package.Available; detectedAt = (Get-Date).ToString('o'); bootTimeAtDetection = Get-SystemBootTime; reason = $Reason; evidencePath = $EvidencePath }
+  [ordered]@{ schemaVersion = '1.0'; computerName = $env:COMPUTERNAME; mode = $Mode; packages = $remaining } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8
+}
+
+function Resolve-PendingRestartVerification {
+  param([object[]]$AvailablePackages)
+
+  $statePath = Get-RestartVerificationStatePath
+  $deferred = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  $failed = New-Object System.Collections.Generic.List[object]
+  if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{ DeferredPackageIds = $deferred; FailedPackages = $failed } }
+
+  try {
+    $pendingState = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $pending = @($pendingState.packages)
+  } catch {
+    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+    return [pscustomobject]@{ DeferredPackageIds = $deferred; FailedPackages = $failed }
+  }
+  $currentBootTime = Get-SystemBootTime
+  $remaining = New-Object System.Collections.Generic.List[object]
+  foreach ($entry in $pending) {
+    $rebooted = $currentBootTime -and $entry.bootTimeAtDetection -and ([datetime]$currentBootTime -gt [datetime]$entry.bootTimeAtDetection)
+    if (-not $rebooted) {
+      [void]$deferred.Add([string]$entry.id)
+      $remaining.Add($entry)
+      Write-AgentEvent -EventId 5300 -EntryType Warning -Fields @{ packageId = [string]$entry.id; status = 'DeferredRestartVerificationPendingReboot'; restartRequired = $true; evidencePath = [string]$entry.evidencePath } | Out-Null
+      continue
+    }
+    $stillOffered = @($AvailablePackages | Where-Object { [string]::Equals([string]$_.Id, [string]$entry.id, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+    if ($stillOffered) {
+      $failedPackage = @($AvailablePackages | Where-Object { [string]::Equals([string]$_.Id, [string]$entry.id, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)[0]
+      $failed.Add($failedPackage)
+      [void]$deferred.Add([string]$entry.id)
+      Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{ packageId = [string]$entry.id; status = 'RestartVerificationFailedStillOffered'; evidencePath = [string]$entry.evidencePath } | Out-Null
+    } else {
+      Write-AgentEvent -EventId 5100 -EntryType Information -Fields @{ packageId = [string]$entry.id; status = 'RestartVerificationResolved'; evidencePath = [string]$entry.evidencePath } | Out-Null
+    }
+  }
+  if ($remaining.Count -eq 0) {
+    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+  } else {
+    [ordered]@{ schemaVersion = '1.0'; computerName = $env:COMPUTERNAME; mode = $Mode; packages = $remaining } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8
+  }
+  return [pscustomobject]@{ DeferredPackageIds = $deferred; FailedPackages = $failed.ToArray() }
 }
 
 function Write-NotificationState {
@@ -913,7 +1041,10 @@ function Test-RetryableInstallerExitCode {
 }
 
 function Select-PolicyPackages {
-  param([object[]]$Packages)
+  param(
+    [object[]]$Packages,
+    [System.Collections.Generic.HashSet[string]]$DeferredPackageIds
+  )
 
   $allowed = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
   foreach ($id in @($script:Policy.allowedPackageIds)) { [void]$allowed.Add($id) }
@@ -924,6 +1055,7 @@ function Select-PolicyPackages {
   return @(
     foreach ($pkg in @($Packages)) {
       if (-not $pkg.Id) { continue }
+      if ($DeferredPackageIds -and $DeferredPackageIds.Contains([string]$pkg.Id)) { continue }
       if ($blocked.Contains([string]$pkg.Id)) {
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
@@ -1019,6 +1151,21 @@ function Get-InstallerExitCodeFromLog {
     return $null
   }
 
+  return $null
+}
+
+function Test-RestartEvidence {
+  param(
+    [Nullable[int]]$InstallerExitCode,
+    [object]$UpgradeResult,
+    [object]$RebootBefore,
+    [object]$RebootAfter
+  )
+
+  if ($InstallerExitCode -in @(3010, 1641)) { return "InstallerExitCode$InstallerExitCode" }
+  $output = "{0}`n{1}" -f [string]$UpgradeResult.StdOut, [string]$UpgradeResult.StdErr
+  if ($output -match '(?i)(restart|reboot)\s+(is\s+)?required|success.*reboot') { return 'WingetRestartMessage' }
+  if (Test-NewRebootMarker -Before $RebootBefore -After $RebootAfter) { return 'NewRebootMarker' }
   return $null
 }
 
@@ -1195,18 +1342,25 @@ function Invoke-PackageUpgrade {
       '--scope', (Get-WingetScopeArgument),
       '--log', $packageLogPath
     )
+    $rule = Get-PackageRule -PackageId ([string]$Package.Id)
+    $installerType = if ($rule) { ([string]$rule.installerType).Trim() } else { '' }
+    if ($installerType) { $args += @('--installer-type', $installerType) }
     if ($script:Policy.includeUnknown) { $args += '--include-unknown' }
     if ($Package.Source) { $args += @('--source', [string]$Package.Source) }
 
+    $rebootBefore = Get-RebootMarkerSnapshot
     if ($PSCmdlet.ShouldProcess([string]$Package.Id, "winget upgrade attempt $attempt")) {
       $upgradeResult = Invoke-WingetProcess -Arguments $args -TimeoutSeconds 1800
       $wingetExitCode = [int]$upgradeResult.ExitCode
     } else {
       $wingetExitCode = 0
-      $upgradeResult = [pscustomobject]@{ TimedOut = $false }
+      $upgradeResult = [pscustomobject]@{ TimedOut = $false; ExitCode = 0; StdOut = ''; StdErr = '' }
     }
 
     $installerExitCode = Get-InstallerExitCodeFromLog -Path $packageLogPath
+    $rebootAfter = Get-RebootMarkerSnapshot
+    $evidencePath = Get-PackageAttemptEvidencePath -Package $Package
+    Write-PackageAttemptEvidence -Package $Package -UpgradeResult $upgradeResult -InstallerExitCode $installerExitCode -RebootBefore $rebootBefore -RebootAfter $rebootAfter -InstallerType $installerType -EvidencePath $evidencePath
     if ($upgradeResult.TimedOut) {
       if ($attempt -lt $maxAttempts) {
         $recoveryActions.Add('retryAfterTimeout')
@@ -1236,10 +1390,12 @@ function Invoke-PackageUpgrade {
       return 'Failed'
     }
 
-    if ($installerExitCode -eq 3010) {
+    $restartEvidence = Test-RestartEvidence -InstallerExitCode $installerExitCode -UpgradeResult $upgradeResult -RebootBefore $rebootBefore -RebootAfter $rebootAfter
+    if ($restartEvidence) {
+      Add-PendingRestartVerification -Package $Package -EvidencePath $evidencePath -Reason $restartEvidence
       Write-AgentEvent -EventId 5300 -EntryType Warning -Fields @{
         packageId         = [string]$Package.Id
-        status            = 'RestartRequired'
+        status            = 'RestartRequiredPendingVerification'
         wingetExitCode    = $wingetExitCode
         wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
         installerExitCode = $installerExitCode
@@ -1247,6 +1403,8 @@ function Invoke-PackageUpgrade {
         recoveryActions   = @($recoveryActions)
         restartRequired   = $true
         logPath           = $packageLogPath
+        evidencePath      = $evidencePath
+        restartEvidence   = $restartEvidence
       } | Out-Null
       return 'RestartRequired'
     }
@@ -1284,6 +1442,21 @@ function Invoke-PackageUpgrade {
     if ($wingetExitCode -eq 0) {
       $verification = Test-WingetPackageStillOffered -Package $Package
       if ($verification.Status -ne 'VerifiedNotOffered') {
+        if ($verification.Status -eq 'VerificationFailedStillOffered' -and $restartEvidence) {
+          Add-PendingRestartVerification -Package $Package -EvidencePath $evidencePath -Reason $restartEvidence
+          Write-AgentEvent -EventId 5300 -EntryType Warning -Fields @{
+            packageId = [string]$Package.Id
+            status = 'RestartRequiredPendingVerification'
+            wingetExitCode = $wingetExitCode
+            wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
+            installerExitCode = $installerExitCode
+            restartRequired = $true
+            restartEvidence = $restartEvidence
+            evidencePath = $evidencePath
+            logPath = $packageLogPath
+          } | Out-Null
+          return 'RestartRequired'
+        }
         Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{
           packageId         = [string]$Package.Id
           status            = [string]$verification.Status
@@ -1295,6 +1468,7 @@ function Invoke-PackageUpgrade {
           retryCount        = $retryCount
           recoveryActions   = @($recoveryActions)
           logPath           = $packageLogPath
+          evidencePath      = $evidencePath
         } | Out-Null
         return 'Failed'
       }
@@ -1308,6 +1482,7 @@ function Invoke-PackageUpgrade {
         retryCount        = $retryCount
         recoveryActions   = @($recoveryActions)
         logPath           = $packageLogPath
+        evidencePath      = $evidencePath
       } | Out-Null
       return 'Succeeded'
     }
@@ -1396,15 +1571,8 @@ try {
 
   $availablePackages = @(Get-WingetUpgradeList)
   Write-WingetInventorySnapshot -Packages $availablePackages
-  $selectedPackages = @(Select-PolicyPackages -Packages $availablePackages)
-
-  if ($selectedPackages.Count -eq 0) {
-    Write-AgentEvent -EventId 5001 -EntryType Information -Fields @{
-      status = 'NoPackagesSelected'
-    } | Out-Null
-    Clear-NotificationState -PreserveRestartRequired
-    exit 0
-  }
+  $restartVerification = Resolve-PendingRestartVerification -AvailablePackages $availablePackages
+  $selectedPackages = @(Select-PolicyPackages -Packages $availablePackages -DeferredPackageIds $restartVerification.DeferredPackageIds)
 
   $summary = @{
     Succeeded       = 0
@@ -1413,6 +1581,19 @@ try {
   }
   $restartRequiredPackages = New-Object System.Collections.Generic.List[object]
   $failedPackages = New-Object System.Collections.Generic.List[object]
+  foreach ($pendingFailure in @($restartVerification.FailedPackages)) {
+    if ($null -eq $pendingFailure) { continue }
+    $summary.Failed++
+    $failedPackages.Add($pendingFailure)
+  }
+
+  if ($selectedPackages.Count -eq 0 -and $summary.Failed -eq 0) {
+    Write-AgentEvent -EventId 5001 -EntryType Information -Fields @{
+      status = 'NoPackagesSelected'
+    } | Out-Null
+    Clear-NotificationState -PreserveRestartRequired
+    exit 0
+  }
 
   foreach ($pkg in $selectedPackages) {
     $result = Invoke-PackageUpgrade -Package $pkg
@@ -1433,7 +1614,11 @@ try {
     recoveryActions = @("Succeeded=$($summary.Succeeded)", "RestartRequired=$($summary.RestartRequired)", "Failed=$($summary.Failed)")
   } | Out-Null
   if ($finalStatus -eq 'Completed') {
-    Clear-NotificationState
+    if ($restartVerification.DeferredPackageIds.Count -gt 0) {
+      Clear-NotificationState -PreserveRestartRequired
+    } else {
+      Clear-NotificationState
+    }
   } else {
     Write-NotificationState -Status $finalStatus -Summary $summary -RestartRequiredPackages $restartRequiredPackages.ToArray() -FailedPackages $failedPackages.ToArray()
   }
@@ -1456,8 +1641,8 @@ try {
 # SIG # Begin signature block
 # MIIgEQYJKoZIhvcNAQcCoIIgAjCCH/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCprlyeRWgS/g9z
-# WrKhVV8cWwBznM+0KuG9kfq+tMbGWaCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAFUPwmXmhHwflB
+# w6TCVoNFHc/vRd68UZogqd1mWEJJ/aCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -1601,29 +1786,29 @@ try {
 # BgoJkiaJk/IsZAEZFgduZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsAhNW
 # AAAA+7iPxuX14sCEAAEAAAD7MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcC
 # AQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYB
-# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEINGx2RhqLSlC
-# iy5/bkELxEOYiAdbkBY6STc+QyismOgOMA0GCSqGSIb3DQEBAQUABIIBADcXg159
-# 72BRn+bBtuk8aN9ACEONnm3IU+YH6OLusZ3UNTOCaRddxbbyAEXyA8jW3NOR/F4r
-# ugn5P85RqKF1mCwSNAU4aEyIWiByWQ80se9VYr43N1MtBVbRTKR/TfEMKEaM/QSf
-# xCa2qX636RHM27Ky4UWGfOY8QImMu8q89xuTaiMmiIATDdIBF9d3RcEI7rZrViAc
-# EnN5GfggpjtyzmanrZTFm8JTgjJiNduy9aXaL69g1ohEeKQ9jC+DOHNcDSj6EGsM
-# BgBvquyZstpoGNnOZ15VAvB9G8gwpEJZ88S7deH2m+yG7H9nCEEEfsw/TZVEkzW+
-# 31FliWCJ3oez7WyhggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
+# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIFJaYm4DazfZ
+# vK0XK36vfNTFfyZbWypUOaL02ZeccBY6MA0GCSqGSIb3DQEBAQUABIIBAB/Wl72w
+# HOZbvOusB3TY4DUT2qDwCzgg6OKG+QIWSVBCDyqp3h/lMcbFwoSEdwIi+R0KGbeK
+# c7rCbkk6ZU/HyTKEHxGEWjRO677cUrrbJe2abluVyEls/ANLO1dKKStpgMl4S0eD
+# PBR72dqQj1Yhx0lpXFMNnEcTc0c3LfkVrozu8FQEg5gAaoTSheofOx+/5/YK1WHB
+# NzSSqyBTTDBgMm3cA23wBtfQ28fEnodM1jveS5LsysnJEr2iKGXb+VbR9HXAzku1
+# 7jppyEdpLslBLoa7f4iNqFBw+UIw650LwsKg4DyFuZ8u5X7KMcnvASVTyxaDsAKm
+# Bi5jcDJCqTpSXEmhggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
 # CQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERp
 # Z2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIw
 # MjUgQ0ExAhAKgO8YS43xBYLRxHanlXRoMA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZI
-# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwNzIwMTg1ODQw
-# WjAvBgkqhkiG9w0BCQQxIgQgHUoCjRIjBqi+46bHDRtq1aDN1egAAU6/2VAqFAxQ
-# aRUwDQYJKoZIhvcNAQEBBQAEggIAH6MzW+0t9d3P50OTlwqe310SeUoFj4zUwO04
-# GLjWSjAejgpDr0g2z2RJQQObnlK+Rz1x/JVHaVaSQMef6sii10JsDICLsf831MpR
-# ZRXi9oDnxed7e+oJLqariGDFtu99kq0uSuq1RhqxBwXM2ZDDciP1tP/3A+oa9yeW
-# ASrAN+mcxgUsr2UVX5vY64bv6tAf43axvekpt+/5yjW8J1NXL2frvgs0fspktPBx
-# WG6SuJect/5DtB/qCC4XW3jhKF074cH65JKR+tEWDLEhjaCvIucLBtGFofsCKTj1
-# l5qb3nXjn8nO+fB7lsqOwe9KZy9pL3OkbffsY0MMBSXhPQ2ra167mk6hlsUuR8HN
-# Clld4SEogsHgF+VLtPgvF4z7H7O4IloYhpgi9+GKKXIej1EKOEcGype/BBt6vq3B
-# ICe4ngR9GUKWvQEUimIkMg9lEMbB2dpTYeUfRfDktnalJrjVuWqJ4DPqHdfluJRf
-# 12H/48PdrQ7qx46FaEdWuIR+VxmmNH8JipXbknlW+v5ghJhZxmBdB7fJ1facIN2c
-# Qzcs4QxheZdcU5bVfZMUQF5zRqo7P7NSHJJmTavXGerH4Q83p750JLfJw9yWtLf/
-# 0pmJXh2LRU4qT+73MUgezuO0REzo/al4eLZtP7xWwl/otuz2lI7EdFR2XOQ6y7x6
-# ARrM7A8=
+# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwNzIyMTg0NjA5
+# WjAvBgkqhkiG9w0BCQQxIgQgPPjT3U4JIw6L0T7OK8Luo1jiUrl9N40PYYGigG/I
+# U28wDQYJKoZIhvcNAQEBBQAEggIAb4kOThmNZIq0anDzZHlIZdnJYuUKDRCpodz6
+# RR1yDK5armGalFlkFxT81u68FWoM209g4lzgrp7VonuhJhv2k83zkRPxhERecdbb
+# C+z6z0FGeVNV72j/2oV5/9XdHeHRGC8qt9CIPa6KNN4XC1RZbW539HcHEwiZ/fHL
+# G3BIJgcFKXBvfzxuxCt1ASNFey9TRWx5+Ptdw7DOK6NqmmbWRkj750PxEDjNwIxm
+# IWHB0HSbZhonwrKbwi+/amf7hjYGu+5anzAYYIWWdSWRaDzIBXgx2Tn2mvYnplS/
+# 7DITVPH+KR4FMN4fPV/pgkIFAVDKD9HOr3IurjL4LJ5sRgdZZO/cOw8v8G4r1dB7
+# 3vxxt7YThAVTaq6s9knxrOXFz0w4h2G7FNWKsROqy0IHiysS4aglKPk5GNeyc1Yb
+# 2V3iAErAi6BOvv9YTIjX1tCLhziDw67HKRLtp+qv6UpelXbXMpvaZjZnyeDXqDuC
+# /NIBTR9FjBk2TfeaysYjs01vtDXYrhifFp90p4ITGSpNoWbz7+W3RmCiKCLGz9PA
+# BMr0kWGdI7qhUQ4SBJhJGuRwGCEvTUydeg7ryW2pH4dIyeYfzrwFIO44DiFBO8kT
+# FV0mNynmSEHDQxlQ7X6fXXECLrpwQ5c5vLPMxWCb+kMw7woIk3nRCcb8h3hmil/1
+# 6AR99fs=
 # SIG # End signature block

@@ -72,6 +72,12 @@ Use `packageRules` for packages that need a stricter change path than ordinary u
     "mode": "ManualOnly",
     "allowMajorVersion": false,
     "processNames": ["node.exe"]
+  },
+  {
+    "id": "Microsoft.PowerShell",
+    "mode": "QuiescenceRequired",
+    "installerType": "wix",
+    "processNames": ["pwsh.exe"]
   }
 ]
 ```
@@ -79,12 +85,17 @@ Use `packageRules` for packages that need a stricter change path than ordinary u
 - `Auto`: eligible for unattended patching, subject to the major-version gate.
 - `ManualOnly`: records `DeferredManualOnly` without launching an installer.
 - `QuiescenceRequired`: records `DeferredProcessInUse` while any configured process is running; it never terminates those processes.
+- `installerType`: optionally constrains the Winget installer type for the package. Use this only where the Winget manifest provides a validated alternative, such as `wix` for machine-scope PowerShell.
 
 The agent records `DeferredMajorVersion` when the first numeric version component changes. This is the default for all packages. A package rule must explicitly set `allowMajorVersion` to `true` to permit an unattended major upgrade.
 
 Use `retryableInstallerExitCodes` only for known transient installer results, such as `1618` when another installation is in progress. Do not add generic fatal result `1603` without package-specific evidence.
 
 The agent verifies a completed upgrade by running a complete read-only `winget upgrade --output json` inventory refresh and searching for the package ID. It must never use `winget upgrade --id <id>` as a verification query because that command launches an installer.
+
+When an installer reports `3010` or `1641`, emits an explicit restart-required message, or introduces a new reboot marker, the agent records `RestartRequiredPendingVerification`. It writes the normal pending user-notification state and durable restart-verification state under `State\pending-restart-verification.json`. On the first run after reboot, the agent re-lists the package inventory before attempting the package again. It records `RestartVerificationResolved` only if the package is no longer offered; a package still offered after reboot becomes `RestartVerificationFailedStillOffered`.
+
+Each package attempt writes a JSON evidence record under `Logs\` with the Winget output, installer exit code, selected installer type, and before/after reboot-marker snapshots. The agent does not treat generic, pre-existing pending file-renames as proof that a package requires a restart.
 
 ## Signing With The Domain CA
 
@@ -380,6 +391,6 @@ Confirm:
 ## Operational Notes
 
 - The agent does not silently install or repair App Installer in v1. If `winget` is missing or broken, it reports a preflight failure for remediation.
-- Installer exit code `3010` is treated as restart-required, not a final package failure.
+- Installer exit codes `3010` and `1641`, explicit Winget restart output, and a new reboot marker are treated as restart-required pending verification, not an immediate final package failure.
 - A failed package is retried only up to `maxRetries`; successful packages are never retried.
 - `rebootPolicy` is `ReportOnly` in v1. Use Wazuh or a separate endpoint management workflow to coordinate reboots.

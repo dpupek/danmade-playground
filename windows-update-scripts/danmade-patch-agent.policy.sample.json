@@ -11,6 +11,21 @@
       "processNames": [
         "node.exe"
       ]
+    },
+    {
+      "id": "Microsoft.PowerShell",
+      "mode": "QuiescenceRequired",
+      "allowMajorVersion": false,
+      "installerType": "wix",
+      "processNames": [
+        "pwsh.exe"
+      ]
+    },
+    {
+      "id": "Microsoft.UI.Xaml.2.7",
+      "mode": "ManualOnly",
+      "allowMajorVersion": false,
+      "processNames": []
     }
   ],
   "maxRetries": 2,
