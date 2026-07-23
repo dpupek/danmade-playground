@@ -343,10 +343,15 @@ function Get-SystemBootTime {
 
 function Get-RebootMarkerSnapshot {
   $pendingRename = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+  $pendingRenameCount = if ($null -eq $pendingRename -or $null -eq $pendingRename.PSObject.Properties['PendingFileRenameOperations']) {
+    0
+  } else {
+    @($pendingRename.PendingFileRenameOperations).Count
+  }
   [pscustomobject]@{
     cbsRebootPending          = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
     windowsUpdateRebootPending = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-    pendingFileRenameCount    = @($pendingRename.PendingFileRenameOperations).Count
+    pendingFileRenameCount    = $pendingRenameCount
     bootTime                  = Get-SystemBootTime
   }
 }
@@ -420,14 +425,14 @@ function Resolve-PendingRestartVerification {
   $statePath = Get-RestartVerificationStatePath
   $deferred = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
   $failed = New-Object System.Collections.Generic.List[object]
-  if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{ DeferredPackageIds = $deferred; FailedPackages = $failed } }
+  if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{ DeferredPackageIds = @(); FailedPackages = @() } }
 
   try {
     $pendingState = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     $pending = @($pendingState.packages)
   } catch {
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
-    return [pscustomobject]@{ DeferredPackageIds = $deferred; FailedPackages = $failed }
+    return [pscustomobject]@{ DeferredPackageIds = @(); FailedPackages = @() }
   }
   $currentBootTime = Get-SystemBootTime
   $remaining = New-Object System.Collections.Generic.List[object]
@@ -454,7 +459,10 @@ function Resolve-PendingRestartVerification {
   } else {
     [ordered]@{ schemaVersion = '1.0'; computerName = $env:COMPUTERNAME; mode = $Mode; packages = $remaining } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8
   }
-  return [pscustomobject]@{ DeferredPackageIds = $deferred; FailedPackages = $failed.ToArray() }
+  return [pscustomobject]@{
+    DeferredPackageIds = @($deferred | ForEach-Object { [string]$_ })
+    FailedPackages     = @($failed | ForEach-Object { $_ })
+  }
 }
 
 function Write-NotificationState {
@@ -1043,8 +1051,11 @@ function Test-RetryableInstallerExitCode {
 function Select-PolicyPackages {
   param(
     [object[]]$Packages,
-    [System.Collections.Generic.HashSet[string]]$DeferredPackageIds
+    [object[]]$DeferredPackageIds
   )
+
+  $deferred = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($id in @($DeferredPackageIds)) { if ($id) { [void]$deferred.Add([string]$id) } }
 
   $allowed = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
   foreach ($id in @($script:Policy.allowedPackageIds)) { [void]$allowed.Add($id) }
@@ -1055,7 +1066,7 @@ function Select-PolicyPackages {
   return @(
     foreach ($pkg in @($Packages)) {
       if (-not $pkg.Id) { continue }
-      if ($DeferredPackageIds -and $DeferredPackageIds.Contains([string]$pkg.Id)) { continue }
+      if ($deferred.Contains([string]$pkg.Id)) { continue }
       if ($blocked.Contains([string]$pkg.Id)) {
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
@@ -1641,8 +1652,8 @@ try {
 # SIG # Begin signature block
 # MIIgEQYJKoZIhvcNAQcCoIIgAjCCH/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAFUPwmXmhHwflB
-# w6TCVoNFHc/vRd68UZogqd1mWEJJ/aCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCgVuGap6GPyY/S
+# 1X0DRZZK2x0toGsGH1QZa+Ovb5DgcqCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -1786,29 +1797,29 @@ try {
 # BgoJkiaJk/IsZAEZFgduZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsAhNW
 # AAAA+7iPxuX14sCEAAEAAAD7MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcC
 # AQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYB
-# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIFJaYm4DazfZ
-# vK0XK36vfNTFfyZbWypUOaL02ZeccBY6MA0GCSqGSIb3DQEBAQUABIIBAB/Wl72w
-# HOZbvOusB3TY4DUT2qDwCzgg6OKG+QIWSVBCDyqp3h/lMcbFwoSEdwIi+R0KGbeK
-# c7rCbkk6ZU/HyTKEHxGEWjRO677cUrrbJe2abluVyEls/ANLO1dKKStpgMl4S0eD
-# PBR72dqQj1Yhx0lpXFMNnEcTc0c3LfkVrozu8FQEg5gAaoTSheofOx+/5/YK1WHB
-# NzSSqyBTTDBgMm3cA23wBtfQ28fEnodM1jveS5LsysnJEr2iKGXb+VbR9HXAzku1
-# 7jppyEdpLslBLoa7f4iNqFBw+UIw650LwsKg4DyFuZ8u5X7KMcnvASVTyxaDsAKm
-# Bi5jcDJCqTpSXEmhggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
+# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIHEC33SC8bk9
+# w1/mjMv+/Vccv4GuLkvW6SgHMiVfOaOAMA0GCSqGSIb3DQEBAQUABIIBAKYeJION
+# yL+jI4i/qSX/9kFyvYx9oPdE8m68ICBFZTKUNkk04mchdRcHMxDTdxRyRZ2o5Ufm
+# 1YzobJPp/VXigGlxHc1Hk330k42JL0TPNEkp3IDAuy1Xoh1hJrKMd59Sn3l0JKbD
+# YqDj6llNkHzYNAE6f/zZpEee216+tlmshfyYcWnhMP16cDdXP62I3kUKrkfVhLiV
+# vtJYv84x4zsCMulrQND6nt9Nj1/7bpgugi8nh9/dgPNxc4w6RgCLEROIqPsyKMNu
+# Ssn2pVV85kgesOD3ElP9zgDma5bRvE6cO/5qLjIpxWZtLhgOUbpydBNFm4BRJesE
+# UV1V1azYnOtViAahggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
 # CQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERp
 # Z2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIw
 # MjUgQ0ExAhAKgO8YS43xBYLRxHanlXRoMA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZI
-# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwNzIyMTg0NjA5
-# WjAvBgkqhkiG9w0BCQQxIgQgPPjT3U4JIw6L0T7OK8Luo1jiUrl9N40PYYGigG/I
-# U28wDQYJKoZIhvcNAQEBBQAEggIAb4kOThmNZIq0anDzZHlIZdnJYuUKDRCpodz6
-# RR1yDK5armGalFlkFxT81u68FWoM209g4lzgrp7VonuhJhv2k83zkRPxhERecdbb
-# C+z6z0FGeVNV72j/2oV5/9XdHeHRGC8qt9CIPa6KNN4XC1RZbW539HcHEwiZ/fHL
-# G3BIJgcFKXBvfzxuxCt1ASNFey9TRWx5+Ptdw7DOK6NqmmbWRkj750PxEDjNwIxm
-# IWHB0HSbZhonwrKbwi+/amf7hjYGu+5anzAYYIWWdSWRaDzIBXgx2Tn2mvYnplS/
-# 7DITVPH+KR4FMN4fPV/pgkIFAVDKD9HOr3IurjL4LJ5sRgdZZO/cOw8v8G4r1dB7
-# 3vxxt7YThAVTaq6s9knxrOXFz0w4h2G7FNWKsROqy0IHiysS4aglKPk5GNeyc1Yb
-# 2V3iAErAi6BOvv9YTIjX1tCLhziDw67HKRLtp+qv6UpelXbXMpvaZjZnyeDXqDuC
-# /NIBTR9FjBk2TfeaysYjs01vtDXYrhifFp90p4ITGSpNoWbz7+W3RmCiKCLGz9PA
-# BMr0kWGdI7qhUQ4SBJhJGuRwGCEvTUydeg7ryW2pH4dIyeYfzrwFIO44DiFBO8kT
-# FV0mNynmSEHDQxlQ7X6fXXECLrpwQ5c5vLPMxWCb+kMw7woIk3nRCcb8h3hmil/1
-# 6AR99fs=
+# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwNzIzMTMyOTEw
+# WjAvBgkqhkiG9w0BCQQxIgQgMeMbBIGajc7vul5dF/DAFgOMc8hs5RAZQL34AaMe
+# F/QwDQYJKoZIhvcNAQEBBQAEggIADvX4tYf8jX59vVMkbwwy/W8G921wQRxutKZm
+# Pb7fDjRRZWvz27dkZOiRJ84EYXE5d0LxXgcAGJPUU9nkNWqMJIeHOpeIucHEH4Mi
+# 6YeqXTCR6pggM+ariS6DI9EixlHlIqzIqqNw3I43/YWBaMo9rO8ykOIB2pGySrXM
+# ipzKuwEQagHnaDv2G1Bg+CbxGD/2AriBMcd7C1rGh/E+wtu/v4+83Lk/PkjYNRf0
+# OzRFPVVbLDqRcjFVhwuQdzyCbp9Jor1+XLr6xM/IMcwGzNrDIqD0n3qG/xw1MCnG
+# OeGcPBuQZWP8szP+wqdAP91OOf4g5Jkcbrljo9AyxTlJCyccyRqqIsXV/2L1m6m9
+# wncKsgz9k8TtgXOc8zY/Hyndt7Lp4FvSUXErePn+3ELRTQmT+PTs0Z5UccnhLNDh
+# 908n71lD4yZKJDAsLCc5zSYxrWhprU90ga5s4qhH0PSRWCVuOuoNHDyIjZE21XKp
+# N2ko/TW7a2q+//bJfzz/uiYn1GOCvVZN4dm+e7zh1r1a70X9Iv61VfK7tCvUsXLm
+# 708GyPzBqzUIksE7+jpxvCsPWtXQ+8Wpu/31hZJvKhOcwjrzFvsLbZRjnPOcXV9c
+# gGhEUJsRTyJWn6kiu3Nilj9RwqBrr9ybZWzbMqANDQzYlXJ+gV9NtTOkkWr2XeZ/
+# JoztOoo=
 # SIG # End signature block

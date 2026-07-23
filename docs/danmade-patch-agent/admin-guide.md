@@ -97,6 +97,8 @@ When an installer reports `3010` or `1641`, emits an explicit restart-required m
 
 Each package attempt writes a JSON evidence record under `Logs\` with the Winget output, installer exit code, selected installer type, and before/after reboot-marker snapshots. The agent does not treat generic, pre-existing pending file-renames as proof that a package requires a restart.
 
+The agent keeps restart-verification state and collection boundaries compatible with Windows PowerShell 5.1, which is the runtime used by the scheduled tasks. Missing `PendingFileRenameOperations` registry values are treated as an empty marker rather than an error.
+
 ## Signing With The Domain CA
 
 Use an internal AD CS code-signing certificate. The signing certificate must include the Code Signing enhanced key usage.
