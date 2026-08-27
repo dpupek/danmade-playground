@@ -11,6 +11,7 @@ Machine mode skips packages that are clearly installed per-user. User mode skips
 ## Files
 
 - `danmade-patch-agent.ps1`: signed endpoint agent.
+- `Test-DanmadePatchAgentHealth.ps1`: signed, report-only stale-process health probe.
 - `danmade-patch-agent.policy.json`: optional policy file copied to endpoints.
 - `danmade-patch-agent.policy.sample.json`: sample policy to copy and edit.
 
@@ -47,6 +48,7 @@ Default behavior:
 - Major-version upgrades are deferred by default. Use a package rule with `allowMajorVersion: true` only after package-specific validation.
 - Each mode writes its read-only Winget upgrade inventory under `Inventory\` so differences between SYSTEM and logged-on-user views can be investigated.
 - Each run has a bounded `maxRunMinutes` deadline. Winget child-process timeouts are clamped to the remaining run time.
+- An inapplicable Winget offer is deferred for seven days when the package ID, installed version, available version, and source remain unchanged. The optional `inapplicableUpgradeDeferralDays` policy value is bounded to 1 through 30 days.
 - No maintenance window restriction.
 - Reboots are reported only.
 - Event Log and JSONL reporting enabled.
@@ -91,11 +93,13 @@ The agent records `DeferredMajorVersion` when the first numeric version componen
 
 Use `retryableInstallerExitCodes` only for known transient installer results, such as `1618` when another installation is in progress. Do not add generic fatal result `1603` without package-specific evidence.
 
-The agent verifies a completed upgrade by running a complete read-only `winget upgrade --output json` inventory refresh and searching for the package ID. It must never use `winget upgrade --id <id>` as a verification query because that command launches an installer.
+The agent verifies only a completed upgrade by running a complete read-only `winget upgrade --output json` inventory refresh and searching for the package ID. It must never use `winget upgrade --id <id>` as a verification query because that command launches an installer.
+
+Winget can return exit code `0` while its command output describes a failed acquisition. HTTP 5xx download failures are recorded as `TransientDownloadFailure`, retried only within the existing `maxRetries` budget, and never sent to inventory verification. The event includes the download URL, HTTP status/HRESULT-derived status, and the package attempt evidence path. A `No applicable upgrade found` result is recorded as `DeferredNoApplicableUpgrade`, not a failed update; its saved evidence captures the installed and available versions, source, and diagnostic output reference. Repeated runs record `DeferredNoApplicableUpgradeCached` until either those values change or the deferral expires.
 
 When an installer reports `3010` or `1641`, emits an explicit restart-required message, or introduces a new reboot marker, the agent records `RestartRequiredPendingVerification`. It writes the normal pending user-notification state and durable restart-verification state under `State\pending-restart-verification.json`. On the first run after reboot, the agent re-lists the package inventory before attempting the package again. It records `RestartVerificationResolved` only if the package is no longer offered; a package still offered after reboot becomes `RestartVerificationFailedStillOffered`.
 
-Each package attempt writes a JSON evidence record under `Logs\` with the Winget output, installer exit code, selected installer type, and before/after reboot-marker snapshots. The agent does not treat generic, pre-existing pending file-renames as proof that a package requires a restart.
+Each package attempt writes a JSON evidence record under `Logs\` with the Winget output, structured command and installer outcomes, selected installer type, and before/after reboot-marker snapshots. The installer parser honors final MSI success markers such as `Installation completed successfully` and `Installation success or error status: 0`; a continued custom-action error is not a terminal MSI failure. Genuine terminal installer `1603` and `1605` results remain failures. The agent does not treat generic, pre-existing pending file-renames as proof that a package requires a restart.
 
 The agent keeps restart-verification state and collection boundaries compatible with Windows PowerShell 5.1, which is the runtime used by the scheduled tasks. Missing `PendingFileRenameOperations` registry values are treated as an empty marker rather than an error.
 
@@ -261,6 +265,17 @@ Arguments:
 -NoProfile -ExecutionPolicy AllSigned -File "C:\ProgramData\DanmadePatchAgent\danmade-patch-agent.ps1" -Mode Machine
 ```
 
+## Health Scheduled Task GPO
+
+Create a computer-side task named `Danmade Patch Agent - Health` that runs as `NT AUTHORITY\SYSTEM` shortly before the daily Machine task, for example daily at `1:45 AM`. Use the same signed SYSVOL script and policy path:
+
+```text
+C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+-NoProfile -ExecutionPolicy AllSigned -File "\\<domain>\SYSVOL\<domain>\scripts\danmade-patch-agent\Test-DanmadePatchAgentHealth.ps1" -PolicyPath "\\<domain>\SYSVOL\<domain>\scripts\danmade-patch-agent\danmade-patch-agent.policy.json"
+```
+
+The health task reads `maxRunMinutes`, the agent's `State\active-run.json`, and only PowerShell processes whose command line invokes `danmade-patch-agent.ps1` in Machine mode. `StaleAgentProcessDetected` is evidence only: the task does not stop a process, disable a task, or change any unrelated scheduled task. Investigate the endpoint before any termination or servicing action.
+
 ## User Scheduled Task GPO
 
 Use this task to cover per-user winget and Store packages.
@@ -312,6 +327,7 @@ Event Log:
   - `5400`: final package failure
   - `5500`: winget repair result
   - `5600`: preflight or agent health failure
+  - `5601`: stale agent process evidence
 
 Wazuh agent config for Event Log:
 
@@ -374,6 +390,7 @@ On a pilot workstation:
 
 ```powershell
 Get-AuthenticodeSignature C:\ProgramData\DanmadePatchAgent\danmade-patch-agent.ps1
+Get-AuthenticodeSignature C:\ProgramData\DanmadePatchAgent\Test-DanmadePatchAgentHealth.ps1
 
 powershell.exe -NoProfile -ExecutionPolicy AllSigned `
   -File C:\ProgramData\DanmadePatchAgent\danmade-patch-agent.ps1 `
@@ -384,6 +401,7 @@ powershell.exe -NoProfile -ExecutionPolicy AllSigned `
 Confirm:
 
 - The scheduled tasks appear after `gpupdate /force`.
+- `Danmade Patch Agent - Health` runs before the Machine task and has no automatic remediation action.
 - `Get-AuthenticodeSignature` returns `Valid`.
 - `Application` contains `DanmadePatchAgent` events.
 - `C:\ProgramData\DanmadePatchAgent\Events\patch-agent.jsonl` receives one JSON object per line during real runs.
@@ -395,4 +413,8 @@ Confirm:
 - The agent does not silently install or repair App Installer in v1. If `winget` is missing or broken, it reports a preflight failure for remediation.
 - Installer exit codes `3010` and `1641`, explicit Winget restart output, and a new reboot marker are treated as restart-required pending verification, not an immediate final package failure.
 - A failed package is retried only up to `maxRetries`; successful packages are never retried.
+- LibreOffice-style HTTP 5xx download failures are acquisition failures, not post-upgrade verification failures. Retest only after the configured retry is exhausted and the download evidence is reviewed.
+- A Temurin MSI log can contain a continued custom-action `1603` before a final success marker. Treat the final installer outcome and inventory verification as authoritative.
+- `Microsoft.Azd` can be inapplicable because of manifest applicability constraints. Capture one verbose Winget diagnostic before changing package policy; the agent's bounded deferral prevents daily failure notifications.
+- For `StaleAgentProcessDetected`, collect the active-run state, task history, and matching process command line first. The health task intentionally does not terminate the process; endpoint remediation is a separately approved action.
 - `rebootPolicy` is `ReportOnly` in v1. Use Wazuh or a separate endpoint management workflow to coordinate reboots.

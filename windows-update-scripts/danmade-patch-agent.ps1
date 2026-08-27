@@ -45,6 +45,8 @@ $script:JsonlPath = $null
 $script:WingetCommand = $null
 $script:CachedUninstallEntries = $null
 $script:RunDeadline = $null
+$script:ActiveRunStatePath = $null
+$script:InapplicableUpgradeStatePath = $null
 
 function New-DefaultPolicy {
   [pscustomobject]@{
@@ -56,6 +58,7 @@ function New-DefaultPolicy {
     maxRetries        = 2
     retryableInstallerExitCodes = @(1618)
     maxRunMinutes     = 120
+    inapplicableUpgradeDeferralDays = 7
     maintenanceWindow = [pscustomobject]@{
       enabled = $false
       start   = '02:00'
@@ -155,6 +158,10 @@ function Merge-Policy {
   if ($maxRunMinutes -lt 15) { $maxRunMinutes = 15 }
   if ($maxRunMinutes -gt 240) { $maxRunMinutes = 240 }
 
+  $inapplicableUpgradeDeferralDays = [int](Get-PropertyValue -Object $LoadedPolicy -Name 'inapplicableUpgradeDeferralDays' -Default $default.inapplicableUpgradeDeferralDays)
+  if ($inapplicableUpgradeDeferralDays -lt 1) { $inapplicableUpgradeDeferralDays = 1 }
+  if ($inapplicableUpgradeDeferralDays -gt 30) { $inapplicableUpgradeDeferralDays = 30 }
+
   return [pscustomobject]@{
     enabled           = [bool](Get-PropertyValue -Object $LoadedPolicy -Name 'enabled' -Default $default.enabled)
     includeUnknown    = [bool](Get-PropertyValue -Object $LoadedPolicy -Name 'includeUnknown' -Default $default.includeUnknown)
@@ -164,6 +171,7 @@ function Merge-Policy {
     maxRetries        = $maxRetries
     retryableInstallerExitCodes = Convert-ToIntArray -Value (Get-PropertyValue -Object $LoadedPolicy -Name 'retryableInstallerExitCodes' -Default $default.retryableInstallerExitCodes)
     maxRunMinutes     = $maxRunMinutes
+    inapplicableUpgradeDeferralDays = $inapplicableUpgradeDeferralDays
     maintenanceWindow = [pscustomobject]@{
       enabled = [bool](Get-PropertyValue -Object $maintenance -Name 'enabled' -Default $default.maintenanceWindow.enabled)
       start   = [string](Get-PropertyValue -Object $maintenance -Name 'start' -Default $default.maintenanceWindow.start)
@@ -313,6 +321,8 @@ function Initialize-AgentStorage {
   Ensure-Directory -Path (Join-Path -Path $LogRoot -ChildPath 'State')
   Ensure-Directory -Path (Join-Path -Path $LogRoot -ChildPath 'Inventory')
   $script:JsonlPath = Join-Path -Path $LogRoot -ChildPath 'Events\patch-agent.jsonl'
+  $script:ActiveRunStatePath = Join-Path -Path $LogRoot -ChildPath 'State\active-run.json'
+  $script:InapplicableUpgradeStatePath = Join-Path -Path $LogRoot -ChildPath 'State\inapplicable-upgrades.json'
 }
 
 function Write-WingetInventorySnapshot {
@@ -335,6 +345,94 @@ function Get-NotificationStatePath {
 
 function Get-RestartVerificationStatePath {
   return (Join-Path -Path $LogRoot -ChildPath 'State\pending-restart-verification.json')
+}
+
+function Write-ActiveRunState {
+  if ($WhatIfPreference -or [string]::IsNullOrWhiteSpace($script:ActiveRunStatePath)) { return }
+
+  [ordered]@{
+    schemaVersion = '1.0'
+    runId         = $script:RunId
+    computerName  = $env:COMPUTERNAME
+    mode          = $Mode
+    processId     = $PID
+    startedAt     = (Get-Date).ToString('o')
+    deadline      = $script:RunDeadline.ToString('o')
+    policyPath    = Resolve-PolicyPath
+  } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:ActiveRunStatePath -Encoding UTF8
+}
+
+function Clear-ActiveRunState {
+  if ($WhatIfPreference -or [string]::IsNullOrWhiteSpace($script:ActiveRunStatePath)) { return }
+  Remove-Item -LiteralPath $script:ActiveRunStatePath -Force -ErrorAction SilentlyContinue
+}
+
+function Get-InapplicableUpgradeState {
+  if ([string]::IsNullOrWhiteSpace($script:InapplicableUpgradeStatePath) -or -not (Test-Path -LiteralPath $script:InapplicableUpgradeStatePath)) { return @() }
+  try {
+    return @(Get-Content -LiteralPath $script:InapplicableUpgradeStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop | Select-Object -ExpandProperty packages)
+  } catch {
+    return @()
+  }
+}
+
+function Save-InapplicableUpgradeState {
+  param([object[]]$Packages)
+
+  if ($WhatIfPreference) { return }
+  [ordered]@{
+    schemaVersion = '1.0'
+    computerName  = $env:COMPUTERNAME
+    mode          = $Mode
+    packages      = @($Packages)
+  } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:InapplicableUpgradeStatePath -Encoding UTF8
+}
+
+function Get-InapplicableUpgradeDeferral {
+  param([object]$Package)
+
+  $now = Get-Date
+  return @(
+    Get-InapplicableUpgradeState | Where-Object {
+      $sameId = [string]::Equals([string]$_.id, [string]$Package.Id, [System.StringComparison]::OrdinalIgnoreCase)
+      $sameInstalled = [string]::Equals([string]$_.installed, [string]$Package.Installed, [System.StringComparison]::OrdinalIgnoreCase)
+      $sameAvailable = [string]::Equals([string]$_.available, [string]$Package.Available, [System.StringComparison]::OrdinalIgnoreCase)
+      $sameSource = [string]::Equals([string]$_.source, [string]$Package.Source, [System.StringComparison]::OrdinalIgnoreCase)
+      $deferredUntil = $null
+      try { $deferredUntil = [datetime]$_.deferredUntil } catch { }
+      $sameId -and $sameInstalled -and $sameAvailable -and $sameSource -and $deferredUntil -and $deferredUntil -gt $now
+    }
+  ) | Select-Object -First 1
+}
+
+function Set-InapplicableUpgradeDeferral {
+  param([object]$Package, [string]$EvidencePath, [object]$CommandOutcome)
+
+  $existing = @(Get-InapplicableUpgradeState | Where-Object { -not [string]::Equals([string]$_.id, [string]$Package.Id, [System.StringComparison]::OrdinalIgnoreCase) })
+  $deferredUntil = (Get-Date).AddDays([int]$script:Policy.inapplicableUpgradeDeferralDays)
+  $existing += [pscustomobject]@{
+    id            = [string]$Package.Id
+    name          = [string]$Package.Name
+    installed     = [string]$Package.Installed
+    available     = [string]$Package.Available
+    source        = [string]$Package.Source
+    deferredAt    = (Get-Date).ToString('o')
+    deferredUntil = $deferredUntil.ToString('o')
+    evidencePath  = $EvidencePath
+    diagnostic    = [string]$CommandOutcome.Diagnostic
+  }
+  Save-InapplicableUpgradeState -Packages $existing
+  return $deferredUntil
+}
+
+function Clear-InapplicableUpgradeDeferral {
+  param([object]$Package)
+
+  $existing = @(Get-InapplicableUpgradeState)
+  $remaining = @($existing | Where-Object { -not [string]::Equals([string]$_.id, [string]$Package.Id, [System.StringComparison]::OrdinalIgnoreCase) })
+  if ($remaining.Count -ne $existing.Count) {
+    Save-InapplicableUpgradeState -Packages $remaining
+  }
 }
 
 function Get-SystemBootTime {
@@ -378,6 +476,8 @@ function Write-PackageAttemptEvidence {
     [object]$Package,
     [object]$UpgradeResult,
     [Nullable[int]]$InstallerExitCode,
+    [object]$InstallerOutcome,
+    [object]$CommandOutcome,
     [object]$RebootBefore,
     [object]$RebootAfter,
     [string]$InstallerType,
@@ -396,6 +496,8 @@ function Write-PackageAttemptEvidence {
     wingetExitCode     = [int]$UpgradeResult.ExitCode
     timedOut           = [bool]$UpgradeResult.TimedOut
     installerExitCode  = $InstallerExitCode
+    installerOutcome   = $InstallerOutcome
+    commandOutcome     = $CommandOutcome
     rebootBefore       = $RebootBefore
     rebootAfter        = $RebootAfter
     stdout             = [string]$UpgradeResult.StdOut
@@ -1139,30 +1241,100 @@ function Select-PolicyPackages {
   )
 }
 
-function Get-InstallerExitCodeFromLog {
+function Get-InstallerOutcomeFromLog {
   param([string]$Path)
-  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+  $result = [ordered]@{
+    ExitCode       = $null
+    FinalSuccess   = $false
+    FailurePattern = $null
+    IgnoredSignals = @()
+  }
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return [pscustomobject]$result }
 
   try {
     $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    if ($text -match '(?im)Installation completed successfully\.|Installation success or error status:\s*0\b') {
+      $result.ExitCode = 0
+      $result.FinalSuccess = $true
+      return [pscustomobject]$result
+    }
+
     $patterns = @(
       '(?i)(?:install|installer|uninstall)\s+failed\s+with\s+exit\s+code:\s*(-?\d+)',
       '(?i)installer\s+return\s+code\s*[:=]\s*(-?\d+)',
       '(?i)msi(?:\s+installer)?\s+(?:return|exit)\s+code\s*[:=]\s*(-?\d+)',
-      '(?i)returned\s+actual\s+error\s+code\s+(-?\d+)',
       '(?i)errorcode\s*:\s*(-?\d+)'
     )
     foreach ($pattern in $patterns) {
       $match = [regex]::Match($text, $pattern)
       if (-not $match.Success) { continue }
       $parsed = 0
-      if ([int]::TryParse($match.Groups[1].Value, [ref]$parsed)) { return $parsed }
+      if ([int]::TryParse($match.Groups[1].Value, [ref]$parsed)) {
+        $result.ExitCode = $parsed
+        $result.FailurePattern = $match.Value
+        return [pscustomobject]$result
+      }
+    }
+
+    foreach ($match in [regex]::Matches($text, '(?im)^.*returned\s+actual\s+error\s+code\s+(-?\d+).*$')) {
+      $line = $match.Value
+      $parsed = 0
+      if (-not [int]::TryParse($match.Groups[1].Value, [ref]$parsed)) { continue }
+      if ($line -match '(?i)(will be translated to success|continue marking|continue\s+on\s+error)') {
+        $result.IgnoredSignals += $line.Trim()
+        continue
+      }
+      $result.ExitCode = $parsed
+      $result.FailurePattern = $line.Trim()
+      return [pscustomobject]$result
     }
   } catch {
-    return $null
+    return [pscustomobject]$result
   }
 
-  return $null
+  return [pscustomobject]$result
+}
+
+function Get-WingetCommandOutcome {
+  param([object]$UpgradeResult)
+
+  $output = "{0}`n{1}" -f [string]$UpgradeResult.StdOut, [string]$UpgradeResult.StdErr
+  $urlMatch = [regex]::Match($output, '(?im)Downloading\s+(https?://\S+)')
+  $url = if ($urlMatch.Success) { $urlMatch.Groups[1].Value.Trim() } else { $null }
+  $httpStatus = $null
+  $hresultMatch = [regex]::Match($output, '(?i)0x8019([0-9a-f]{4})')
+  if ($hresultMatch.Success) {
+    try { $httpStatus = [Convert]::ToInt32($hresultMatch.Groups[1].Value, 16) } catch { }
+  }
+
+  if ($output -match '(?i)Download request status is not success|Package download failed|Failed when downloading') {
+    $isTransient = $httpStatus -ge 500 -and $httpStatus -lt 600
+    return [pscustomobject]@{
+      Status       = if ($isTransient) { 'TransientDownloadFailure' } else { 'DownloadFailure' }
+      IsRetryable  = $isTransient
+      HttpStatus   = $httpStatus
+      DownloadUrl  = $url
+      Diagnostic   = ($output.Trim())
+    }
+  }
+
+  if ($output -match '(?i)No applicable upgrade found\.|does not apply to your system or requirements') {
+    return [pscustomobject]@{
+      Status       = 'NoApplicableUpgrade'
+      IsRetryable  = $false
+      HttpStatus   = $null
+      DownloadUrl  = $null
+      Diagnostic   = ($output.Trim())
+    }
+  }
+
+  return [pscustomobject]@{
+    Status       = if ([int]$UpgradeResult.ExitCode -eq 0) { 'Succeeded' } else { 'WingetFailed' }
+    IsRetryable  = $false
+    HttpStatus   = $null
+    DownloadUrl  = $null
+    Diagnostic   = ($output.Trim())
+  }
 }
 
 function Test-RestartEvidence {
@@ -1335,6 +1507,20 @@ function Test-WingetPreflight {
 function Invoke-PackageUpgrade {
   param([object]$Package)
 
+  $existingDeferral = Get-InapplicableUpgradeDeferral -Package $Package
+  if ($existingDeferral) {
+    Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
+      packageId     = [string]$Package.Id
+      status        = 'DeferredNoApplicableUpgradeCached'
+      installed     = [string]$Package.Installed
+      available     = [string]$Package.Available
+      source        = [string]$Package.Source
+      deferredUntil = [string]$existingDeferral.deferredUntil
+      evidencePath  = [string]$existingDeferral.evidencePath
+    } | Out-Null
+    return 'Deferred'
+  }
+
   $safeId = ([string]$Package.Id -replace '[^A-Za-z0-9._-]', '_')
   $packageLogPath = Join-Path -Path (Join-Path -Path $LogRoot -ChildPath 'Logs') -ChildPath ("{0}-{1}.log" -f $safeId, (Get-Date -Format 'yyyyMMdd-HHmmss'))
   $maxAttempts = [int]$script:Policy.maxRetries + 1
@@ -1368,10 +1554,12 @@ function Invoke-PackageUpgrade {
       $upgradeResult = [pscustomobject]@{ TimedOut = $false; ExitCode = 0; StdOut = ''; StdErr = '' }
     }
 
-    $installerExitCode = Get-InstallerExitCodeFromLog -Path $packageLogPath
+    $installerOutcome = Get-InstallerOutcomeFromLog -Path $packageLogPath
+    $installerExitCode = $installerOutcome.ExitCode
+    $commandOutcome = Get-WingetCommandOutcome -UpgradeResult $upgradeResult
     $rebootAfter = Get-RebootMarkerSnapshot
     $evidencePath = Get-PackageAttemptEvidencePath -Package $Package
-    Write-PackageAttemptEvidence -Package $Package -UpgradeResult $upgradeResult -InstallerExitCode $installerExitCode -RebootBefore $rebootBefore -RebootAfter $rebootAfter -InstallerType $installerType -EvidencePath $evidencePath
+    Write-PackageAttemptEvidence -Package $Package -UpgradeResult $upgradeResult -InstallerExitCode $installerExitCode -InstallerOutcome $installerOutcome -CommandOutcome $commandOutcome -RebootBefore $rebootBefore -RebootAfter $rebootAfter -InstallerType $installerType -EvidencePath $evidencePath
     if ($upgradeResult.TimedOut) {
       if ($attempt -lt $maxAttempts) {
         $recoveryActions.Add('retryAfterTimeout')
@@ -1399,6 +1587,75 @@ function Invoke-PackageUpgrade {
         logPath           = $packageLogPath
       } | Out-Null
       return 'Failed'
+    }
+
+    if ($commandOutcome.Status -eq 'TransientDownloadFailure') {
+      if ($attempt -lt $maxAttempts) {
+        $recoveryActions.Add('retryTransientDownload')
+        Write-AgentEvent -EventId 5200 -EntryType Warning -Fields @{
+          packageId         = [string]$Package.Id
+          status            = 'TransientDownloadFailureRetryScheduled'
+          wingetExitCode    = $wingetExitCode
+          wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
+          retryCount        = $retryCount
+          recoveryActions   = @($recoveryActions)
+          httpStatus        = $commandOutcome.HttpStatus
+          downloadUrl       = $commandOutcome.DownloadUrl
+          diagnostic        = $commandOutcome.Diagnostic
+          evidencePath      = $evidencePath
+          logPath           = $packageLogPath
+        } | Out-Null
+        continue
+      }
+
+      Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{
+        packageId         = [string]$Package.Id
+        status            = 'TransientDownloadFailure'
+        failureReason     = 'DownloadHttp5xxAfterRetry'
+        wingetExitCode    = $wingetExitCode
+        wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
+        retryCount        = $retryCount
+        recoveryActions   = @($recoveryActions)
+        httpStatus        = $commandOutcome.HttpStatus
+        downloadUrl       = $commandOutcome.DownloadUrl
+        diagnostic        = $commandOutcome.Diagnostic
+        evidencePath      = $evidencePath
+        logPath           = $packageLogPath
+      } | Out-Null
+      return 'Failed'
+    }
+
+    if ($commandOutcome.Status -eq 'DownloadFailure') {
+      Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{
+        packageId         = [string]$Package.Id
+        status            = 'DownloadFailure'
+        failureReason     = 'DownloadFailureNotRetryable'
+        wingetExitCode    = $wingetExitCode
+        wingetExitCodeHex = Convert-ToHexCode -Code $wingetExitCode
+        retryCount        = $retryCount
+        httpStatus        = $commandOutcome.HttpStatus
+        downloadUrl       = $commandOutcome.DownloadUrl
+        diagnostic        = $commandOutcome.Diagnostic
+        evidencePath      = $evidencePath
+        logPath           = $packageLogPath
+      } | Out-Null
+      return 'Failed'
+    }
+
+    if ($commandOutcome.Status -eq 'NoApplicableUpgrade') {
+      $deferredUntil = Set-InapplicableUpgradeDeferral -Package $Package -EvidencePath $evidencePath -CommandOutcome $commandOutcome
+      Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
+        packageId     = [string]$Package.Id
+        status        = 'DeferredNoApplicableUpgrade'
+        installed     = [string]$Package.Installed
+        available     = [string]$Package.Available
+        source        = [string]$Package.Source
+        deferredUntil = $deferredUntil.ToString('o')
+        diagnostic    = $commandOutcome.Diagnostic
+        evidencePath  = $evidencePath
+        logPath       = $packageLogPath
+      } | Out-Null
+      return 'Deferred'
     }
 
     $restartEvidence = Test-RestartEvidence -InstallerExitCode $installerExitCode -UpgradeResult $upgradeResult -RebootBefore $rebootBefore -RebootAfter $rebootAfter
@@ -1495,6 +1752,7 @@ function Invoke-PackageUpgrade {
         logPath           = $packageLogPath
         evidencePath      = $evidencePath
       } | Out-Null
+      Clear-InapplicableUpgradeDeferral -Package $Package
       return 'Succeeded'
     }
 
@@ -1547,6 +1805,7 @@ try {
   Write-AgentEvent -EventId 5000 -EntryType Information -Fields @{
     status = 'RunStarted'
   } | Out-Null
+  Write-ActiveRunState
 
   if (-not $script:Policy.enabled) {
     Write-AgentEvent -EventId 5001 -EntryType Information -Fields @{
@@ -1647,13 +1906,15 @@ try {
     Write-Warning "Danmade Patch Agent failed before reporting was available: $($_.Exception.Message)"
   }
   exit 1
+} finally {
+  try { Clear-ActiveRunState } catch { }
 }
 
 # SIG # Begin signature block
 # MIIgEQYJKoZIhvcNAQcCoIIgAjCCH/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCgVuGap6GPyY/S
-# 1X0DRZZK2x0toGsGH1QZa+Ovb5DgcqCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAzzhUEoKX/d23X
+# z6JQcfofMie7mjr7Ekb8BDiPq8nSeaCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -1797,29 +2058,29 @@ try {
 # BgoJkiaJk/IsZAEZFgduZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsAhNW
 # AAAA+7iPxuX14sCEAAEAAAD7MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcC
 # AQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYB
-# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIHEC33SC8bk9
-# w1/mjMv+/Vccv4GuLkvW6SgHMiVfOaOAMA0GCSqGSIb3DQEBAQUABIIBAKYeJION
-# yL+jI4i/qSX/9kFyvYx9oPdE8m68ICBFZTKUNkk04mchdRcHMxDTdxRyRZ2o5Ufm
-# 1YzobJPp/VXigGlxHc1Hk330k42JL0TPNEkp3IDAuy1Xoh1hJrKMd59Sn3l0JKbD
-# YqDj6llNkHzYNAE6f/zZpEee216+tlmshfyYcWnhMP16cDdXP62I3kUKrkfVhLiV
-# vtJYv84x4zsCMulrQND6nt9Nj1/7bpgugi8nh9/dgPNxc4w6RgCLEROIqPsyKMNu
-# Ssn2pVV85kgesOD3ElP9zgDma5bRvE6cO/5qLjIpxWZtLhgOUbpydBNFm4BRJesE
-# UV1V1azYnOtViAahggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
+# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIKBkkfk0ZLK6
+# SEBMgiDf++t+QLky55Gb0ADJL+1FQFo8MA0GCSqGSIb3DQEBAQUABIIBAHepN7JE
+# 0EjQEQ1DLv7Zd8ot6J93/Wk2edEAxKEkKpeWZ7Pdb7xjJHemtLd/bY0m9F/a2Aoq
+# pHtYDgdmMRNVYlgdIhCnCIS1fIqtgTNREzjr1tWPyrWjzIgPxhfEt3uARre2vPgW
+# wGZwBCUMjWVvtQx2G7FLGSt08BxFyXlYNqBxfGQP9YPSgB2mqa6Urx3q/lZ+BvUE
+# 06Lg7R85nhlt2/d65tLoBOVAk1NzqjRBYtsBlattkMt5V/BwPRfFGVYyfJBjEeb0
+# t1MbBA+4DJUfzQW6xSljY64EhIdUWTVoL0UKz1VCibbE9Ui2AHpTzgDmC9KvQMCx
+# 5+ryF/A5amzfEuehggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
 # CQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERp
 # Z2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIw
 # MjUgQ0ExAhAKgO8YS43xBYLRxHanlXRoMA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZI
-# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwNzIzMTMyOTEw
-# WjAvBgkqhkiG9w0BCQQxIgQgMeMbBIGajc7vul5dF/DAFgOMc8hs5RAZQL34AaMe
-# F/QwDQYJKoZIhvcNAQEBBQAEggIADvX4tYf8jX59vVMkbwwy/W8G921wQRxutKZm
-# Pb7fDjRRZWvz27dkZOiRJ84EYXE5d0LxXgcAGJPUU9nkNWqMJIeHOpeIucHEH4Mi
-# 6YeqXTCR6pggM+ariS6DI9EixlHlIqzIqqNw3I43/YWBaMo9rO8ykOIB2pGySrXM
-# ipzKuwEQagHnaDv2G1Bg+CbxGD/2AriBMcd7C1rGh/E+wtu/v4+83Lk/PkjYNRf0
-# OzRFPVVbLDqRcjFVhwuQdzyCbp9Jor1+XLr6xM/IMcwGzNrDIqD0n3qG/xw1MCnG
-# OeGcPBuQZWP8szP+wqdAP91OOf4g5Jkcbrljo9AyxTlJCyccyRqqIsXV/2L1m6m9
-# wncKsgz9k8TtgXOc8zY/Hyndt7Lp4FvSUXErePn+3ELRTQmT+PTs0Z5UccnhLNDh
-# 908n71lD4yZKJDAsLCc5zSYxrWhprU90ga5s4qhH0PSRWCVuOuoNHDyIjZE21XKp
-# N2ko/TW7a2q+//bJfzz/uiYn1GOCvVZN4dm+e7zh1r1a70X9Iv61VfK7tCvUsXLm
-# 708GyPzBqzUIksE7+jpxvCsPWtXQ+8Wpu/31hZJvKhOcwjrzFvsLbZRjnPOcXV9c
-# gGhEUJsRTyJWn6kiu3Nilj9RwqBrr9ybZWzbMqANDQzYlXJ+gV9NtTOkkWr2XeZ/
-# JoztOoo=
+# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwODI3MTc1NjQ5
+# WjAvBgkqhkiG9w0BCQQxIgQghZMWCIB2QwBev8VnEynND5vxbS4+Sd7baEKBBzeF
+# TsQwDQYJKoZIhvcNAQEBBQAEggIABr3RQi39O3P/KzaJg7mj4UwofqUCTn5/nqdk
+# rrQjcw69wN1McCScscCv42tXQ41o8KkWfsmt75QLbDDpe7N2aCR87pUGTEDDHxmI
+# 8kwsu1um6OhaC0CUpvDLcKfdhlBNAFqtlxi5+RLFF4MVoZ7wpFBjVMqFrKUl9YE9
+# SJFvVx9XaVUaaXwKFajS/6spf4j20hJv+eKx4SRDRiUtN6bCnZ4FyRq6wspytwfD
+# F+E5u3NVdY9apqcm+ZNTdcrBkV7MdimAJxfCotGiuNQtXvVRZDfWU0r2DRI9AQiD
+# Q9ZBCtubPxne57bBVWo82XLc+PPoEneSLNeFIds95ib51SykYmCcc4APlpMV9gni
+# Ay2h4c9DaThHNeDURmzoOGLGK2oLTYgXlT7ONNLK3NOqhCjEBhW7yrKFFFxQSicU
+# 6IC5jkZrMxl8Xp55nwvLjfEEzCXmd4oMP5kEGmovWYQkq4TD4y/mfWaSP2vB+0ps
+# SxF7i9SwmBFrdgx6v3QjV+sh/TlxHDS+dR5M5INET4GFxxF3bhLVO4N2vMJRWgDx
+# cDveOsdYZsOAbVvpDKNoOR2iYPyqEreEF21Wjz+a+P1bh41iX1uz4/f9vB/GnQV7
+# Vg9R6HOl4yzVFkdUG7SESFqCKsSH4PjDMBjMuoVPuxatmgDtPI4h5FO0l0RbGqHw
+# sFr49xY=
 # SIG # End signature block
