@@ -81,6 +81,20 @@ The patch agent is intentionally separate from the interactive updater:
 
 Start with [`danmade-patch-agent.policy.sample.json`](/E:/Sandbox/danmade-playground/windows-update-scripts/danmade-patch-agent.policy.sample.json), then follow the deployment and signing guide in [`docs/danmade-patch-agent/admin-guide.md`](/E:/Sandbox/danmade-playground/docs/danmade-patch-agent/admin-guide.md).
 
+Reliability hardening uses a required policy, explicit inventory outcomes, bounded acquisition retries, evidence-backed applicability deferrals, and report-only health heartbeats. Use [Install-DanmadePatchAgentCache.ps1](Install-DanmadePatchAgentCache.ps1) to stage signed local releases and [Invoke-DanmadePatchAgentCached.ps1](Invoke-DanmadePatchAgentCached.ps1) for local scheduled task execution. Keep user tasks on the hidden WScript launcher.
+
+Regression tests (Windows PowerShell 5.1; artifacts stay in `.scratch`):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentFunctions.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentHardening.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentCache.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentReliability.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentCacheAcl.ps1
+```
+
+`Bypass` is confined to local test fixtures. Production tasks remain `AllSigned`. The fake-winget harness replaces only host observation functions and retry sleeping in its scratch copy; default machine scenarios mock SYSTEM identity and do not prove real SYSTEM deployment. `-RunMachineAsSystem` optionally exercises actual temporary SYSTEM tasks from an elevated operator session. Cache dispatch tests mock signing APIs; real signature validation remains a separate release gate. Track rollout in the [reliability plan](../docs/danmade-patch-agent/reliability-plan.md).
+
 ## Portable package cleanup
 
 If you want to remove installed `winget` portable packages and delete their package directories through `winget uninstall --purge`, run:

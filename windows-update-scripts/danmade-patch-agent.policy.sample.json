@@ -13,6 +13,18 @@
       ]
     },
     {
+      "id": "OpenJS.NodeJS.LTS",
+      "mode": "ManualOnly",
+      "allowMajorVersion": false,
+      "processNames": ["node.exe"]
+    },
+    {
+      "id": "Microsoft.Edge",
+      "mode": "NativeUpdater",
+      "allowMajorVersion": false,
+      "processNames": []
+    },
+    {
       "id": "Microsoft.PowerShell",
       "mode": "QuiescenceRequired",
       "allowMajorVersion": false,

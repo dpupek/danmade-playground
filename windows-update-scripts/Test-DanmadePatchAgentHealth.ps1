@@ -15,7 +15,9 @@ param(
 
   [string]$LogRoot = 'C:\ProgramData\DanmadePatchAgent',
 
-  [string]$ProcessSnapshotPath
+  [string]$ProcessSnapshotPath,
+
+  [string]$TaskSnapshotPath
 )
 
 Set-StrictMode -Version Latest
@@ -48,7 +50,11 @@ function Get-PolicyMaxRunMinutes {
 function Get-ActiveRunState {
   $path = Join-Path -Path $LogRoot -ChildPath 'State\active-run.json'
   if (-not (Test-Path -LiteralPath $path)) { return $null }
-  try { return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+  try {
+    $state = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if (-not (Get-PropertyValue $state 'runId') -or [int](Get-PropertyValue $state 'processId' 0) -le 0) { throw 'Invalid active-run identity.' }
+    return $state
+  } catch { $script:ActiveStateError = $_.Exception.Message; return $null }
 }
 
 function Get-MatchingAgentProcesses {
@@ -99,11 +105,28 @@ function Write-HealthEvent {
 }
 
 $maxRunMinutes = Get-PolicyMaxRunMinutes
+$script:ActiveStateError = $null
 $activeRun = Get-ActiveRunState
 $now = Get-Date
+$findings = 0
+$cachePointer = Join-Path (Split-Path -Parent $PSScriptRoot) 'current.json'
+if (Test-Path -LiteralPath $cachePointer) {
+  try {
+    $release = Get-Content -LiteralPath $cachePointer -Raw | ConvertFrom-Json
+    $verified = [datetime]::MinValue
+    if (-not [datetime]::TryParse([string](Get-PropertyValue $release 'verifiedAt' ''), [ref]$verified) -or $verified -lt $now.AddHours(-168) -or $verified -gt $now.AddMinutes(5)) { throw 'Local policy verification is missing, stale, or future-dated.' }
+  } catch {
+    $findings++
+    Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'LocalPolicyRefreshRequired'; message = $_.Exception.Message; response = 'ReportOnlyNoTermination' }
+  }
+}
+if ($script:ActiveStateError) {
+  $findings++
+  Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'HealthStateUnreadable'; message = $script:ActiveStateError; response = 'ReportOnlyNoTermination' }
+}
 $matches = @(
   Get-MatchingAgentProcesses | Where-Object {
-    $_.Name -match '^(?i)powershell\.exe$' -and $_.CommandLine -match '(?i)danmade-patch-agent\.ps1' -and $_.CommandLine -match '(?i)-Mode\s+Machine'
+    $_.Name -match '^(?i)powershell\.exe$' -and $_.CommandLine -match '(?i)(danmade-patch-agent|Invoke-DanmadePatchAgentCached)\.ps1' -and $_.CommandLine -match '(?i)-Mode\s+Machine'
   }
 )
 
@@ -111,6 +134,7 @@ foreach ($process in $matches) {
   try { $startedAt = [datetime]$process.CreationDate } catch { continue }
   $ageMinutes = [math]::Round(($now - $startedAt).TotalMinutes, 1)
   if ($ageMinutes -le $maxRunMinutes) { continue }
+  $findings++
 
   Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{
     status          = 'StaleAgentProcessDetected'
@@ -126,11 +150,88 @@ foreach ($process in $matches) {
   }
 }
 
+if ($activeRun -and @($matches | Where-Object { [int]$_.ProcessId -eq [int]$activeRun.processId }).Count -eq 0) {
+  $findings++
+  Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{
+    status = 'OrphanedActiveRunDetected'
+    activeRunId = [string]$activeRun.runId
+    processId = $activeRun.processId
+    response = 'ReportOnlyNoTermination'
+  }
+}
+
+try {
+  $tasks = if ($TaskSnapshotPath) {
+    @(Get-Content -LiteralPath $TaskSnapshotPath -Raw | ConvertFrom-Json)
+  } elseif ($ProcessSnapshotPath) { @() } else {
+    @(foreach ($name in @('Danmade Patch Agent - Machine', 'Danmade Patch Agent - Health')) {
+      $task = Get-ScheduledTask -TaskName $name -ErrorAction Stop
+      $info = $task | Get-ScheduledTaskInfo -ErrorAction Stop
+      [pscustomobject]@{ Name = $name; State = [string]$task.State; LastRunTime = $info.LastRunTime; LastTaskResult = $info.LastTaskResult }
+    })
+  }
+  foreach ($task in $tasks) {
+    if ($task.Name -eq 'Danmade Patch Agent - Health') { continue }
+    if ($task.State -eq 'Running' -or [long]$task.LastTaskResult -ne 0) {
+      $findings++
+      Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{
+        status = 'AgentTaskNeedsReview'
+        taskName = $task.Name
+        taskState = $task.State
+        lastRunTime = $task.LastRunTime
+        lastTaskResult = $task.LastTaskResult
+        response = 'ReportOnlyNoTermination'
+      }
+    }
+  }
+} catch {
+  $findings++
+  Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'HealthTaskReadbackUnavailable'; message = $_.Exception.Message }
+}
+
+$jsonlPath = Join-Path $LogRoot 'Events\patch-agent.jsonl'
+$terminalStatuses = @('Completed', 'CompletedWithFailures', 'CompletedRestartRequired', 'NoPackagesSelected', 'DisabledByPolicy', 'SkippedOutsideMaintenanceWindow', 'PreflightFailed', 'UnhandledAgentError', 'InventoryInconclusive', 'PolicyLoadFailedNoPatching', 'MachineModeNotRunningAsSystem', 'LocalBootstrapFailed')
+$lastTerminal = $null
+$incomplete = @{}
+if (Test-Path -LiteralPath $jsonlPath) {
+  foreach ($line in (Get-Content -LiteralPath $jsonlPath -Tail 3000)) {
+    try {
+      $record = $line | ConvertFrom-Json -ErrorAction Stop
+      if ($record.mode -eq 'Machine' -and $record.status -eq 'RunStarted') { $incomplete[[string]$record.runId] = [datetime]$record.timestamp }
+      if ($record.mode -eq 'Machine' -and $record.status -in $terminalStatuses) {
+        $lastTerminal = [datetime]$record.timestamp
+        $incomplete.Remove([string]$record.runId)
+      }
+    } catch {
+      $findings++
+      Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'HealthLogRecordUnreadable' }
+      break
+    }
+  }
+}
+foreach ($id in $incomplete.Keys) {
+  if (($now - $incomplete[$id]).TotalMinutes -gt $maxRunMinutes) {
+    $findings++
+    Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'IncompleteAgentRunDetected'; activeRunId = $id; startedAt = $incomplete[$id]; response = 'ReportOnlyNoTermination' }
+  }
+}
+if (-not $lastTerminal -or ($now - $lastTerminal).TotalHours -gt 26) {
+  $findings++
+  Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'AgentRunEvidenceMissing'; lastTerminalAt = $lastTerminal; thresholdHours = 26; response = 'ReportOnlyNoTermination' }
+}
+Write-HealthEvent -EventId 5002 -EntryType Information -Fields @{
+  status = 'HealthCheckCompleted'
+  findings = $findings
+  matchingProcessCount = $matches.Count
+  maxRunMinutes = $maxRunMinutes
+  lastAgentTerminalAt = $lastTerminal
+  response = 'ReportOnlyNoTermination'
+}
 # SIG # Begin signature block
 # MIIgEQYJKoZIhvcNAQcCoIIgAjCCH/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCTgptPEZ57KJfm
-# MkslRbvSicACFgK8In5vg02Y2H+AwaCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCsXhz7vZNA6zXo
+# Nl0ySCT0d1YKv6NY01ENCoTRdUOnuqCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -196,25 +297,25 @@ foreach ($process in $matches) {
 # YTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/DJbg3s6KCLPAlZ66RzIg9sC+NJpud
 # /v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHbxtl5TPau1j/1MIDpMPx0LckTetiS
 # uEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAPvIXKUjPSxyZsq8WhbaM2tszWkPZP
-# ubdcMIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC0cR2p5V0aDANBgkqhkiG9w0BAQsF
+# ubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7bww+P+ZIYNTANBgkqhkiG9w0BAQsF
 # ADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNV
 # BAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hB
-# MjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAwMFoXDTM2MDkwMzIzNTk1OVowYzEL
+# MjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAwMFoXDTM3MTEwNDIzNTk1OVowYzEL
 # MAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMTswOQYDVQQDEzJE
-# aWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1lc3RhbXAgUmVzcG9uZGVyIDIwMjUg
-# MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBANBGrC0Sxp7Q6q5gVrMr
-# V7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA69HFTBdwbHwBSOeLpvPnZ8ZN+vo8
-# dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6wW2R6kSu9RJt/4QhguSssp3qome7M
-# rxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00Cll8pjrUcCV3K3E0zz09ldQ//nBZ
-# ZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOMA3CoB/iUSROUINDT98oksouTMYFO
-# nHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmotuQhcg9tw2YD3w6ySSSu+3qU8DD+n
-# igNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1OpbybpMe46YceNA0LfNsnqcnpJeIt
-# K/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeHVZlc4seAO+6d2sC26/PQPdP51ho1
-# zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1roSrgHjSHlq8xymLnjCbSLZ49kPmk
-# 8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSUROwnu7zER6EaJ+AliL7ojTdS5PWPsW
-# eupWs7NpChUk555K096V1hE0yZIXe+giAwW00aHzrDchIc2bQhpp0IoKRR7YufAk
-# prxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGVMIIBkTAMBgNVHRMBAf8EAjAAMB0G
-# A1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM6DAfBgNVHSMEGDAWgBTvb1NK6eQG
+# aWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1lc3RhbXAgUmVzcG9uZGVyIDIwMjYg
+# MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBALZ7pvLJ/s1K+NSbTGWz
+# /TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy24fcpKXlgRiky4WAawDfU3YP0BMx
+# t9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJCcN0ASURML5uFIS80sZsDwO3BSkU
+# xDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7pfGEXiMlneJIC5/YKuizVzNFKZZE
+# eoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtklTJXeIg283hw7TmmsZXR+SMbjbrEO
+# vZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/whITPAo9b75Zr4Ta6Mj3URm26QZYMn
+# /FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/ug0eeOzmZ6QTFg33otX+bFRsIolv
+# ykE1jive4PuESaT8zzVeFWDAMDtozNgLctkGD1ZjkEyZtJrLl5ya0m5doH/ScpaZ
+# CZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nkddsnb/ItVKi/2nXpQNMu1PT5prW8
+# 3vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3ZnqMqAQQP9u3Ai9t+5eQ02GDwy0ODjd
+# zi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvfpklkZQvw3+kv3vUPItdwroczk9ic
+# flf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGVMIIBkTAMBgNVHRMBAf8EAjAAMB0G
+# A1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN4jAfBgNVHSMEGDAWgBTvb1NK6eQG
 # fHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMCB4AwFgYDVR0lAQH/BAwwCgYIKwYB
 # BQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQGCCsGAQUFBzABhhhodHRwOi8vb2Nz
 # cC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKGUWh0dHA6Ly9jYWNlcnRzLmRpZ2lj
@@ -222,18 +323,18 @@ foreach ($process in $matches) {
 # NTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSgUqBQhk5odHRwOi8vY3JsMy5kaWdp
 # Y2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRUaW1lU3RhbXBpbmdSU0E0MDk2U0hB
 # MjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAIBgZngQwBBAIwCwYJYIZIAYb9bAcB
-# MA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcEua5gQezRCESeY0ByIfjk9iJP2zWL
-# pQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/YmRDfxT7C0k8FUFqNh+tshgb4O6Lgj
-# g8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8AQ/UdKFOtj7YMTmqPO9mzskgiC3Q
-# YIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/EABgfZXLWU0ziTN6R3ygQBHMUBaB5
-# bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQVTeLni2nHkX/QqvXnNb+YkDFkxUG
-# tMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gVutDojBIFeRlqAcuEVT0cKsb+zJNE
-# suEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85EE8LUkqRhoS3Y50OHgaY7T/lwd6U
-# Arb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hggt8l2Yv7roancJIFcbojBcxlRcGG
-# 0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJgKf47CdxVRd/ndUlQ05oxYy2zRWV
-# FjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLvUxxVZE/rptb7IRE2lskKPIJgbaP5
-# t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7POGT75qaL6vdCvHlshtjdNXOCIUjs
-# arfNZzCCBu4wggXWoAMCAQICE1YAAAD7uI/G5fXiwIQAAQAAAPswDQYJKoZIhvcN
+# MA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1SCt+ZrAmAfn0oQLFr0mLywSLaDXQI
+# ENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT12os5ipDCy35RBCg2UMeApEtrfGh
+# z45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uwn+H600u4D7RnOGf8Wj4UNgAdZkfH
+# hHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9d8Nh/thn6hH23d+VsPAr6GAYyzSA
+# 02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy0PxpawPtGRyaBVGzq+UiTfM8pD7K
+# VyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0YcT2oRVBm3JETjajHug2AL+v5jht
+# KVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb6T/6WcwTwXmQ9lOCLLYcsQeSWmvK
+# qzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7LCkRYVnhA2D73FLje1O5b3HR5eHs
+# 0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/JgwtKfZM5dqO94lbUveOiJBI+xZEbGR
+# sMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKSXjDbD6rgg39H5Mh7QfieAIjWagkJ
+# Nt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATlWJdYeeDRGCyatf8R1hSjzSvdN8yW
+# QPT9gzCCBu4wggXWoAMCAQICE1YAAAD7uI/G5fXiwIQAAQAAAPswDQYJKoZIhvcN
 # AQELBQAwSDEVMBMGCgmSJomT8ixkARkWBWxvY2FsMRcwFQYKCZImiZPyLGQBGRYH
 # bmV4cG9ydDEWMBQGA1UEAxMNbmV4cG9ydC1sb2NhbDAeFw0yNjA3MDYxNjEzMjla
 # Fw0yNzA3MDYxNjEzMjlaMHQxFTATBgoJkiaJk/IsZAEZFgVsb2NhbDEXMBUGCgmS
@@ -274,29 +375,29 @@ foreach ($process in $matches) {
 # BgoJkiaJk/IsZAEZFgduZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsAhNW
 # AAAA+7iPxuX14sCEAAEAAAD7MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcC
 # AQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYB
-# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIIN467KcLdil
-# kIx/9yvIf6/SnuMqe0bmFaBthBs6Q6gHMA0GCSqGSIb3DQEBAQUABIIBAC/VFYbl
-# M7up1rIhoniyc3xmSLC/nKftWEwSWKica72hbQqXqyPyzRw1oTeEFwQG9959TG9r
-# PTG4h3k37N9PIpaC4xt3Wdph782xtZR6Kk4H+E2yu9rwmH/qsFJEQAuFM7ZXmmzG
-# RIX2zFbRsCJDk6tGR1POG016twYMXih5fgHNrnCrNxjHAzFDUhy3aqZLDAescDCq
-# r7XMDK17oS0CIVXZEqkxuoyJosQSsO3ivhfGbIYzHfZ977uGA29gK8FExep1mFtV
-# rkPnufPi44Zva2rW3UIFrq8HJWHGlODSke3KdRtgenvFTSbiH1VYjGzDFqeLetiX
-# cy9yCevtG+pkoeOhggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
+# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIKKPekP3cgMP
+# PoPR+c9KwmwHO8cVGlb5ayXqq0kK+syXMA0GCSqGSIb3DQEBAQUABIIBAJkjEEec
+# 6+G+joS6y2dxud3lQh91zwD6qV5WWNJr5Q7xT2nYnOc6TY82qPECfQxGAeeF2lRc
+# /iB9xRlteUNpvsuw8mBCZGpsXb1E31WISHwhllSuRLitlqPxP691Kh3AUBDTwAHX
+# lFW/rJKCj2vxut4VLMGJXEiHE+RABVRq3w/z53ysGvc/zxnil+/875LKkN2Rg/fZ
+# 9WDYPbA2SRDk0mOkSY2CKt8a0pkD15SzCN21IhV9eu65L4ebSZ0QI6wKGktYldEg
+# EGQZo/4eqWu9IrxmpR0nG3RUSkY76uWIJleIUs4EB2UsVNFAxfOdRNS4V2dSBPjO
+# uZk8pAGh72exD5KhggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
 # CQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERp
 # Z2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIw
-# MjUgQ0ExAhAKgO8YS43xBYLRxHanlXRoMA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZI
-# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwODI3MTgwMTU0
-# WjAvBgkqhkiG9w0BCQQxIgQgQYqvVn9fvmAJQDRPDpmYPW2b3htnx6rxZRNg1UtU
-# WgswDQYJKoZIhvcNAQEBBQAEggIAml0AC0Vym2eSakZogfd7C1JqKcXk/huwA1Kl
-# Zd4ehZElzz93T56J9Imz/jDUoUj2t+G7+WHOuTgseWEEDAm2r7a1/9CL66TWR45y
-# /pgbYbW2LaEjHoxglE67tdPe8NhqGTaDtqNpvEJKu388qvadkCHiPn9bkJNGIyRd
-# WKf8B/LqMBhKeVv0yl6cKwfQK2mjieo2Fntx8TA9iStA2WeBGA/YWVQNMJVVemVJ
-# TrARlD9I+CyEvg1UCu1CDqm7OpF6JDrWaWuGFcA/UUJ1EGK6/E5IPrdzEXslcSA0
-# sFY4XLODtPN/G/lSUuZrm43dWkkIU7ZNIfp67J7jc8I809uZjD1nCTJ7m8+Tc0b+
-# 4w2f00EawRiHwnCXnsAedMYPpJBxHTDpK5RVZUH4LAFvCJ7pnJvVXRCRajtfi/4a
-# 5rbU5p6TxqBSGCUo983f4EbUxcst04NhXjgcdUvIXeRpszMdiCs1MClxxQ59PTw7
-# lgK6CWWS1fSi2c1QrwqVUkHHwWCY7oNIWxd3OOzBm9gylwXSzw2VhR2TmkhivI7y
-# QBmnp63DXYw7hYZHjzRNRlNjkMif2oE+gqWunNHCxyIeR1LG9KK8picc/Csj4CZW
-# 9Jz8lw1oS/s311dd7Wk6llE++WADImcnDFbnrVqRk33e8KDJOOAMBR2RAHaDdO61
-# fuJcEcA=
+# MjUgQ0ExAhAIT9wzT35FTtvDD4/5khg1MA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZI
+# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYxMDE2MTczOTQ0
+# WjAvBgkqhkiG9w0BCQQxIgQgnEcRRvOCrvQaa3/0GK3WuCNpTYRpFau5/4lqFo3V
+# QaswDQYJKoZIhvcNAQEBBQAEggIASg5Lcgc5Yoqrm7CQBwjY+TerpBpUUEjfK4wh
+# 5lXvBAa6Oz7XQxs5hXfPF4GwkE1AShQ4Ww/8k7CRzCWeN8kG3fLjZ/ZMFP0IceFB
+# alYPrNweEs2SFIJ0iDhFkUTX3mkzNNtWYNJ1qa3Kq7AdvodNM2BTPXDBnYaqIVIr
+# S8/k4hiRAVvP7n4i0NLYrCKcC8Yu9U7xbLf78OxBbYQcGGcTYauKphjsIAbOYTj5
+# aIsMi9s7/ABFHaQ4ZCufHrFr5gNnsNG41E9IylRUw0cEMJQbJQN5B06k5kPUg1FY
+# UEZ783nHjBEb/F3nMsAke1+ClIQzzcimoICpZ55DmjN94InFVmANkitHUo3B3lbN
+# PlkNZvLVRS2QyUAb9j92f8VNTgbyY+oFYRvMN0JsIYrRx6N6UDoChpqPi9A4SMYY
+# XON3Uqsujlpi25X/yfVZt1RnfChPfrTgkV2UD8hf4FdwuodPYlB2gSnKxrZZ2Sgr
+# XJO8sdDAlTEZOJhUdyiGBjqorgxARBSELShOYdFX6+RsE3QijF2GCbfpv9N1gzNh
+# C7LL6hUiAIgvB5gnKNgr942i3VdsMM683WbWGNVHEluUm2YXg7tIL6Nh/TZaotZy
+# 8GgDxoUV95j6Jsn/OTLIHS/OVZQp1zhuX8hoDq5s4X7obi40cOCoL5XEYLDVQO1X
+# U+sW1oc=
 # SIG # End signature block

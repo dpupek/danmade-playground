@@ -7,6 +7,8 @@ Dim command
 Dim quote
 Dim exitCode
 Dim powerShellPath
+Dim fileSystem
+Dim scriptDirectory
 
 If WScript.Arguments.Count <> 1 Then
   WScript.Quit 87
@@ -16,6 +18,20 @@ mode = LCase(WScript.Arguments(0))
 quote = Chr(34)
 Set shell = CreateObject("WScript.Shell")
 powerShellPath = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
+Set fileSystem = CreateObject("Scripting.FileSystemObject")
+scriptDirectory = fileSystem.GetParentFolderName(WScript.ScriptFullName)
+
+If mode <> "user" And mode <> "notification" Then
+  WScript.Quit 87
+End If
+
+If LCase(scriptDirectory) = LCase(shell.ExpandEnvironmentStrings("%ProgramData%\DanmadePatchAgent\Package")) Then
+  command = quote & powerShellPath & quote & _
+    " -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy AllSigned -File " & _
+    quote & scriptDirectory & "\Invoke-DanmadePatchAgentCached.ps1" & quote & " -Mode " & mode
+  exitCode = shell.Run(command, 0, True)
+  WScript.Quit exitCode
+End If
 
 Select Case mode
   Case "user"
