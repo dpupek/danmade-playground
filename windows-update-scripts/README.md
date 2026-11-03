@@ -5,6 +5,7 @@
 Use [`run-winget-ms-store-update-all.cmd`](/E:/Sandbox/danmade-playground/windows-update-scripts/run-winget-ms-store-update-all.cmd) to launch [`winget-ms-store-update-all.ps1`](/E:/Sandbox/danmade-playground/windows-update-scripts/winget-ms-store-update-all.ps1).
 
 Why the `.cmd` launcher exists:
+
 - The PowerShell script now requires PowerShell 7 or later.
 - If `pwsh` is not installed, the launcher can offer to install the latest PowerShell with `winget`.
 - After PowerShell 7 is available, the launcher runs the script for you.
@@ -16,6 +17,7 @@ If you run the `.ps1` file directly from Windows PowerShell 5.1 or another unsup
 When `Out-GridView` is available, the script opens a grid picker for package selection.
 
 Grid selection tips:
+
 - `Ctrl+Click` selects nonconsecutive rows.
 - `Shift+Click` selects a range.
 - `Ctrl+A` selects all rows.
@@ -46,6 +48,7 @@ That injects a test-only `Microsoft.PowerShell` entry into the picker so you can
 Use [`winget-ms-store-update-remote.ps1`](/E:/Sandbox/danmade-playground/windows-update-scripts/winget-ms-store-update-remote.ps1) when you need to query or run winget upgrades on another Windows computer over PowerShell remoting.
 
 This remote variant is intentionally separate from the local interactive updater:
+
 - no `Out-GridView`, `Read-Host`, or local UAC popup flow
 - no end-of-run pause prompt
 - defaults to listing available upgrades unless you explicitly pass `-All` or `-PackageId`
@@ -65,6 +68,7 @@ Examples:
 ```
 
 Notes:
+
 - PowerShell remoting/WinRM must already be enabled on the target computer.
 - The remote session must already have enough rights to run `winget`; this script does not try to open a UAC prompt remotely.
 - Some Microsoft Store or per-user installs may still behave differently in a remote admin session than they do in a local interactive desktop session.
@@ -74,6 +78,7 @@ Notes:
 Use [`danmade-patch-agent.ps1`](/E:/Sandbox/danmade-playground/windows-update-scripts/danmade-patch-agent.ps1) for unattended domain-managed patching through Group Policy scheduled tasks.
 
 The patch agent is intentionally separate from the interactive updater:
+
 - no prompts, `Out-GridView`, UAC relaunches, or end-of-run pause
 - policy-driven package allow/block lists and retry limits
 - Wazuh-friendly Windows Event Log and JSONL reporting
@@ -91,6 +96,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/t
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentCache.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentReliability.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentCacheAcl.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentPilotFixes.ps1
 ```
 
 `Bypass` is confined to local test fixtures. Production tasks remain `AllSigned`. The fake-winget harness replaces only host observation functions and retry sleeping in its scratch copy; default machine scenarios mock SYSTEM identity and do not prove real SYSTEM deployment. `-RunMachineAsSystem` optionally exercises actual temporary SYSTEM tasks from an elevated operator session. Cache dispatch tests mock signing APIs; real signature validation remains a separate release gate. Track rollout in the [reliability plan](../docs/danmade-patch-agent/reliability-plan.md).
@@ -112,6 +118,13 @@ This cleanup mode is explicit on purpose:
 For example, `PHP.PHP.8.2` and `PHP.PHP.8.3` are separate packages. Cleanup mode lets you remove one or both intentionally.
 
 ## Validation
+
+The pilot outcome regressions are in [Test-PatchAgentPilotFixes.ps1](tests/Test-PatchAgentPilotFixes.ps1).
+Run with Windows PowerShell 5.1. They exercise applicability, notification ownership,
+Chrome/SQL selection, restart metadata and Health assessment freshness using local
+fixtures only. Release acceptance also requires the function, reliability, fake-winget,
+cache-dispatch and pure cache-ACL suites under `tests`; a green test is not endpoint
+or next-window acceptance. See the [reliability plan](../docs/danmade-patch-agent/reliability-plan.md).
 
 After changing [`winget-ms-store-update-all.ps1`](/E:/Sandbox/danmade-playground/windows-update-scripts/winget-ms-store-update-all.ps1), run:
 

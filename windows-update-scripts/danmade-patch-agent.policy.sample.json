@@ -25,6 +25,24 @@
       "processNames": []
     },
     {
+      "id": "Google.Chrome",
+      "mode": "Auto",
+      "allowMajorVersion": true,
+      "processNames": []
+    },
+    {
+      "id": "Google.Chrome.EXE",
+      "mode": "Auto",
+      "allowMajorVersion": true,
+      "processNames": []
+    },
+    {
+      "id": "Microsoft.SQLServer.2025.Developer",
+      "mode": "ManualOnly",
+      "allowMajorVersion": false,
+      "processNames": []
+    },
+    {
       "id": "Microsoft.PowerShell",
       "mode": "QuiescenceRequired",
       "allowMajorVersion": false,

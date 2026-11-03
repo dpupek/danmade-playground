@@ -111,7 +111,7 @@ public static class FakeWinget
         if (!string.IsNullOrWhiteSpace(statePath)) { File.WriteAllText(statePath, listCount.ToString()); }
         if (scenario == "InventoryFailure") { Console.WriteLine("Source unavailable"); return 42; }
         if (scenario == "VerificationMalformed" && listCount > 1) { Console.WriteLine("{\"unexpectedSchema\":[]}"); return 0; }
-        if (scenario != "StillOffered" && scenario != "NoApplicableUpgrade" && listCount > 1) { Console.WriteLine("[]"); return 0; }
+        if (scenario != "StillOffered" && scenario != "NoApplicableUpgrade" && scenario != "NoApplicableInstaller" && listCount > 1) { Console.WriteLine("[]"); return 0; }
         Console.WriteLine("[{\"PackageIdentifier\":\"" + Escape(packageId) + "\",\"PackageName\":\"" + Escape(packageName) + "\",\"InstalledVersion\":\"" + Escape(installedVersion) + "\",\"AvailableVersion\":\"" + Escape(availableVersion) + "\",\"Source\":\"" + source + "\"}]");
         return 0;
       }
@@ -121,6 +121,7 @@ public static class FakeWinget
         string logPath = args[logIndex + 1];
         Directory.CreateDirectory(Path.GetDirectoryName(logPath));
         if (scenario == "InstalledPackageNotFound") { Console.WriteLine("No installed package found matching input criteria."); return unchecked((int)0x8A150014); }
+        if (scenario == "NoApplicableInstaller") { Console.WriteLine("No applicable installer found; see logs for more details."); return unchecked((int)0x8A150010); }
         if (scenario == "NativeRestart") { Console.WriteLine("Restart your PC to finish installation."); return unchecked((int)0x8A150109); }
         if (scenario == "BurnRestart") { File.WriteAllText(logPath,"[BF38:78F0]i007: Exit code: 0xbc2, restarting: No"); Console.WriteLine("Restart your PC to finish installation."); return 0; }
         if (scenario == "TechnologyMismatch") { Console.WriteLine("A newer version was found, but the install technology is different from the current version installed. Please uninstall the package and install the newer version."); return 0; }
@@ -425,6 +426,21 @@ $noApplicableCached = Invoke-AgentScenario -Name 'user-no-applicable-upgrade' -M
 Assert-True -Condition (@($noApplicableCached.Events | Where-Object { $_.status -eq 'DeferredNoApplicableUpgradeCached' }).Count -eq 1) -Message 'No-applicable-upgrade cache did not suppress the second attempt.'
 Assert-True -Condition (@($noApplicableCached.Calls | Where-Object { $_.Args -contains '--id' }).Count -eq 1) -Message 'No-applicable-upgrade cache should prevent a second named upgrade attempt.'
 
+# Arrange / initial assert: captured pre-install applicability failure, no previous notification.
+$noInstallerRoot = Join-Path $runRoot 'user-no-applicable-installer'
+Assert-True (-not (Test-Path $noInstallerRoot)) 'No-installer fixture must be new.'
+# Act: exercise the real classifier, state writer and terminal flow.
+$noInstaller = Invoke-AgentScenario -Name 'user-no-applicable-installer' -Mode User -Scenario NoApplicableInstaller -PackageId 'Microsoft.Azd' -PackageName 'Azure Developer CLI' -ScenarioRoot $noInstallerRoot
+# Assert: administrator deferral, no retry, verification or user failure notification.
+Assert-True ($noInstaller.ExitCode -eq 0) 'No applicable installer must not fail the entire run.'
+Assert-True (@($noInstaller.Events | Where-Object { $_.status -eq 'DeferredNoApplicableInstaller' -and $_.requiresAdminRemediation }).Count -eq 1) 'No-installer reason/admin ownership lost.'
+Assert-True (@($noInstaller.Calls | Where-Object { $_.Args -contains '--log' }).Count -eq 1) 'No installer failure must not retry.'
+Assert-True (@($noInstaller.Calls | Where-Object { $_.Args -contains '--output' }).Count -eq 1) 'No installer failure must not verify.'
+Assert-True (-not (Test-Path (Join-Path $noInstaller.LogRoot 'State\pending-notification.json'))) 'Administrator deferral created a user failure nag.'
+$noInstallerCached = Invoke-AgentScenario -Name 'user-no-applicable-installer' -Mode User -Scenario NoApplicableInstaller -PackageId 'Microsoft.Azd' -PackageName 'Azure Developer CLI' -ScenarioRoot $noInstallerRoot
+Assert-True (@($noInstallerCached.Events | Where-Object status -eq 'DeferredNoApplicableInstallerCached').Count -eq 1) 'No-installer cache did not preserve the reason.'
+Assert-True (@($noInstallerCached.Calls | Where-Object { $_.Args -contains '--log' }).Count -eq 1) 'Cached no-installer deferral attempted installation again.'
+
 $manualOnly = Invoke-AgentScenario -Name 'manual-only' -Mode User -Scenario Success -PackageId 'OpenJS.NodeJS' -PackageName 'Node.js' -PackageRules @([pscustomobject]@{ id='OpenJS.NodeJS'; mode='ManualOnly'; allowMajorVersion=$false; processNames=@('node.exe') }) -InstalledVersion '24.18.0' -AvailableVersion '26.4.0'
 Assert-True -Condition ($manualOnly.ExitCode -eq 0) -Message 'Manual-only scenario should exit 0.'
 Assert-True -Condition (@($manualOnly.Events | Where-Object { $_.status -eq 'DeferredManualOnly' }).Count -eq 1) -Message 'Manual-only scenario did not log DeferredManualOnly.'
@@ -459,6 +475,10 @@ foreach ($case in @(
   # Assert: exact status, exit, and installer invocation count.
   Assert-True ($result.ExitCode -eq $case.ExitCode) "$($case.Name): unexpected exit $($result.ExitCode)."
   Assert-True (@($result.Events | Where-Object status -eq $case.Status).Count -eq 1) "$($case.Name): missing $($case.Status)."
+  if ($case.Scenario -eq 'Installer3010') {
+    $terminal = @($result.Events | Where-Object status -eq 'CompletedRestartRequired')
+    Assert-True ($terminal.Count -eq 1 -and $terminal[0].restartRequired -and $terminal[0].newRestartCount -eq 1) 'Restart terminal metadata must match the package outcome.'
+  }
   Assert-True (@($result.Calls | Where-Object { $_.Args -contains '--id' }).Count -eq $case.Attempts) "$($case.Name): wrong attempt count."
   if ($case.Scenario -in @('TechnologyMismatch','NoAvailableUpgrade','DownloadTimeout')) {
     Assert-True (@($result.Calls | Where-Object { $_.Args -contains '--output' }).Count -eq 1) "$($case.Name): unexpected post-upgrade verification."
@@ -525,5 +545,5 @@ try {
   Status = 'Passed'
   RunRoot = $runRoot
   MachineScenario = if ($machineSuccess.Skipped) { $machineSuccess.SkipReason } else { 'Passed' }
-  Scenarios = @($machineSuccess.Name, $userSuccess.Name, $stillOffered.Name, $installer1605.Name, $installer1603.Name, $continuedInstallerSuccess.Name, $downloadFailure.Name, $noApplicable.Name, $manualOnly.Name, $majorVersion.Name, $quiescence.Name, 'health-stale-process', 'health-orphan-and-launch-failure', 'edge-technology-mismatch','copilot-no-upgrade','chrome-download-timeout','msi-later-failure','msi-restart','inventory-failure','verification-malformed','installed-package-not-found','native-restart','burn-restart','node-lts-manual-only','edge-native-updater','ReleaseHold','ReleaseHoldUnreadable','ReleaseHoldCorrected')
+  Scenarios = @($machineSuccess.Name, $userSuccess.Name, $stillOffered.Name, $installer1605.Name, $installer1603.Name, $continuedInstallerSuccess.Name, $downloadFailure.Name, $noApplicable.Name, $noInstaller.Name, $manualOnly.Name, $majorVersion.Name, $quiescence.Name, 'health-stale-process', 'health-orphan-and-launch-failure', 'edge-technology-mismatch','copilot-no-upgrade','chrome-download-timeout','msi-later-failure','msi-restart','inventory-failure','verification-malformed','installed-package-not-found','native-restart','burn-restart','node-lts-manual-only','edge-native-updater','ReleaseHold','ReleaseHoldUnreadable','ReleaseHoldCorrected')
 } | ConvertTo-Json -Depth 5

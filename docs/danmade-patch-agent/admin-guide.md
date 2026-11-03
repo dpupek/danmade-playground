@@ -1,6 +1,6 @@
 # Danmade Patch Agent Admin Guide
 
-Date: 2026-10-16
+Date: 2026-11-03
 
 Operator Level: Windows-first beginner operator (little Windows domain experience and no Linux experience)
 
@@ -168,36 +168,36 @@ Use a computer GPO linked to the workstation/server OU.
 2. Create or edit `Danmade Patch Agent - Trust`.
 3. Import the Domain Root CA certificate into:
 
-```text
-Computer Configuration
-  Policies
-    Windows Settings
-      Security Settings
-        Public Key Policies
-          Trusted Root Certification Authorities
-```
+   ```text
+   Computer Configuration
+     Policies
+       Windows Settings
+         Security Settings
+           Public Key Policies
+             Trusted Root Certification Authorities
+   ```
 
 4. Import the code-signing publisher certificate into:
 
-```text
-Computer Configuration
-  Policies
-    Windows Settings
-      Security Settings
-        Public Key Policies
-          Trusted Publishers
-```
+   ```text
+   Computer Configuration
+     Policies
+       Windows Settings
+         Security Settings
+           Public Key Policies
+             Trusted Publishers
+   ```
 
 5. Set PowerShell execution policy:
 
-```text
-Computer Configuration
-  Policies
-    Administrative Templates
-      Windows Components
-        Windows PowerShell
-          Turn on Script Execution
-```
+   ```text
+   Computer Configuration
+     Policies
+       Administrative Templates
+         Windows Components
+           Windows PowerShell
+             Turn on Script Execution
+   ```
 
 Set it to `Allow only signed scripts`.
 
@@ -470,13 +470,21 @@ Confirm:
 - Final Burn `i007` exits are interpreted as decimal or hex. `0xbc2` is restart-required success; HRESULT-wrapped MSI `1603` remains fatal. WinGet restart-to-finish differs from restart-before-install failure.
 - `NativeUpdater` leaves installation to the product's native updater and reports the installed/offered version as `DeferredNativeUpdater` with administrator follow-up. Confirm the native updater is functioning; this is not a compliance-success exemption.
 - Add both `OpenJS.NodeJS` and `OpenJS.NodeJS.LTS` as `ManualOnly` to protect the development runtime.
-- Optional `releaseHolds` on a package rule contain `version`, `scope` (`machine` or `user`), `installerSha256` (64 hex characters), `until` (ISO date/time), and `reason`. The agent inspects the selected installer hash without installing. A matching known-bad hash yields `DeferredKnownBadRelease`; failed or ambiguous metadata yields `DeferredReleaseHoldUnverified`. A corrected hash releases the hold immediately, even at the same version. Review holds before expiry; do not disable installer hashing or target verification.
+- Optional `releaseHolds` on a package rule contain `version`, `scope` (`machine` or `user`), `installerSha256` (64 hex characters), `until` (ISO review deadline), and `reason`. The agent inspects the selected installer hash without installing. A matching known-bad hash yields `DeferredKnownBadRelease`; failed or ambiguous metadata yields `DeferredReleaseHoldUnverified`. A corrected hash releases the hold immediately, even at the same version. Passing the deadline sets `reviewOverdue`; it does not authorize retrying the same bad bytes. Review overdue holds; do not disable installer hashing or target verification.
 - Upgrades pin `--version` to the inspected target. Post-reboot installed versions at or above that recorded target count as resolved even if a newer release is offered.
-- Failure notifications and cached deferrals clear only when successful inventory or an exact, unique, same-scope uninstall record proves the target is installed. Pending reboot notifications require recorded reboot verification; a clean run must not discard an older mixed-outcome restart.
+- Failure notifications and cached deferrals normally clear only when successful inventory or an exact, unique, same-scope uninstall record proves the target is installed. An exact ID/source/target failure reclassified as ManualOnly, KnownBadRelease or NoApplicableInstaller is instead preserved in administrator-owned `inapplicable-upgrades.json` with `priorNotificationFailure` and `FailureReclassifiedForAdministrator` evidence. This removes only that user failure notice, not unrelated failures or restart targets, and does not claim installation success. Pending reboot notifications require recorded reboot verification; a clean run must not discard an older mixed-outcome restart.
 - An enabled maintenance window with `machineOnly: true` limits Machine starts without suppressing normal User logon updates. The pilot catch-up window is 02:00-04:00 local time. No new package attempt begins outside it; an installer already started may finish afterward. No automatic reboot is performed.
 - Local releases expire for Machine/User patching seven days after `current.json` `verifiedAt`. A daily signed cache refresh revalidates source hashes/signers and atomically refreshes the pointer; unchanged releases reuse the same directory. Health/Notification remain available to report stale policy. `LocalPolicyRefreshRequired` and `LocalBootstrapFailed` require operator review, not an execution-policy bypass.
 
 For the separately tracked SYSTEM API evaluation, see the [Microsoft.WinGet.Client iteration](reliability-plan.md#future-iteration-microsoftwingetclient). It is not enabled by this release.
+
+### October 27 Monitoring And Applicability Rules
+
+- `DeferredNoApplicableInstaller` preserves native `0x8A150010` before installer start, distinct from `0x8A150014` and `0x8A15002B`. Review the attempt evidence and actual product registration; no user restart nag, installer retry or post-install verification follows this result. The seven-day deferral is invalidated by changed installed/available versions, source or scope.
+- Chrome major releases are allowed only by explicit `Google.Chrome` and `Google.Chrome.EXE` rules. SQL Server 2025 Developer uses ManualOnly; compare instance PatchLevel/CU evidence rather than reinstalling a base version offered with Unknown inventory.
+- Health records `lastAssessmentAt` separately from `lastSkippedAt`. `AgentAssessmentOverdue` means no completed assessment within 26 hours, even when daytime catches correctly skip. Investigate availability during 02:00-04:00; do not widen the installation window silently.
+- An incomplete historical log record followed by a later assessment is not a current hang when neither active state nor a matching live process corroborates it. Historical records remain intact; genuine active/recent incomplete execution still generates evidence.
+- Terminal records expose `assessmentCompleted`, discovery/selection/deferred counts and `pendingRestartCount`, `newRestartCount`, `carriedRestartCount`. `restartRequired` includes carried targets; task result 0 is not proof of compliance or restart activation.
 
 - The agent does not silently install or repair App Installer in v1. If `winget` is missing or broken, it reports a preflight failure for remediation.
 - Installer exit codes `3010` and `1641`, explicit Winget restart output, and a new reboot marker are treated as restart-required pending verification, not an immediate final package failure.

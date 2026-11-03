@@ -1,6 +1,6 @@
 # Patch Agent Reliability Hardening
 
-Date: 2026-10-16
+Date: 2026-11-03
 
 Operator Level: Windows-first beginner operator (little Windows domain experience and no Linux experience)
 
@@ -17,6 +17,45 @@ dependency. The current inventory reader can mistake failure for an empty list,
 and unavailable policy falls back to broad defaults.
 
 ## Iterations
+
+### November 3 Progress And Source-Control Checkpoint
+
+- [x] Reconcile the October 27 outcome/Health fixes with source and published bytes; retain NoApplicableInstaller administrator deferrals, bad-hash quarantine after review deadlines, Chrome-only major upgrades, SQL Developer ManualOnly and exact-target failure-notice transfer.
+- [x] Rerun all six suites under Windows PowerShell 5.1: 38 function checks, 29 reliability checks, 29 fake-winget/Health scenarios, nine cache-dispatch checks, six pure ACL checks and 13 pilot regressions, 124 total. Eight script parser checks and sample-policy JSON validation also passed. Tests used local fixtures; no real installer, diagnostic SYSTEM task or endpoint restart was invoked.
+- [x] Verify all five release PS1 signatures remain Valid, timestamped and signed by the approved domain publisher. Fresh authenticated readback on both DCs confirms the October 27 agent, Health and policy hashes unchanged.
+- [x] Record selective DNS correction and aging observation in [case 255215](https://darwin-global.fogbugz.com/f/cases/255215/), Active and assigned to Daniel Pupek. Five confirmed obsolete VPN A records were removed; nexport.local aging is enabled with 3-day no-refresh and 7-day refresh. Both DNS servers retain automatic scavenging disabled. This shared-zone correction is not patch-agent rollout expansion.
+- [ ] Review timestamp registration, static exclusions and unexplained old records on or after November 13 in case 255215. Future scavenging/additional deletions require separate approval; rapid VPN address reuse remains a separate registration/ownership concern.
+- [ ] Investigate the current DEVWKS03 domain-based SYSVOL access limitation: Get-FileHash through nexport.local returns "The request is not supported" while both direct DC shares return the expected agent hash. The referral target could not be captured because dfsutil.exe is unavailable. Do not infer a server outage or flush/change DFS/network configuration from this observation alone.
+- [ ] Revalidate the local protected cache and full 17-member acceptance, then evaluate actual next-window package outcomes and pending restart targets. The seven remote Refresh/Health successes are October 27 evidence, not a new fleet scan; DEVWKS03 and the other unverified members remain open.
+- [ ] Review the four VS Code release-hold deadlines due November 3; unchanged bad hashes remain quarantined after the deadline. Azure Developer CLI applicability and future Microsoft.WinGet.Client evaluation remain separate work.
+
+Current-checkpoint receipts are local-only under
+`E:\Sandbox\SysOps-And-CyberSecurity\.scratch\progress-sync-20261103-201551`.
+No new publication, forced patch task, cache refresh, policy change, package update
+or reboot was performed for this source-control checkpoint. Source signing bytes
+are preserved; documentation changes do not require re-signing release scripts.
+
+### October 27 Pilot Outcome Corrections
+
+Baseline: the October 26 pilot review found expired VS Code bad-hash holds,
+no-installer applicability results presented as failed installations, SQL base
+installer offers against a serviced instance, Chrome milestone deferrals and
+Health confusing recent skips with recent assessments. Preserve the existing
+17-member pilot, seven blocked IDs and endpoint-local 02:00-04:00 Machine window.
+
+- [x] Distinguish native 0x8A150010 from identity mismatch/no-upgrade; retain bounded administrator deferrals with original attempt evidence and no installer retry/verification.
+- [x] Keep unchanged known-bad hashes quarantined after their review deadline; allow a corrected hash immediately and report overdue review.
+- [x] Add Chrome-only major-version permission and SQL Server 2025 Developer ManualOnly policy coverage.
+- [x] Transfer only exact ID/source/target failure notices to administrator evidence for these deferrals; preserve unrelated failures and all restart notices.
+- [x] Separate current/historical incomplete runs and assessment/skip timestamps; include selection deferrals and new/carried restart counts in terminal records.
+- [x] Validate deterministic regressions without installing applications or creating diagnostic SYSTEM tasks.
+- [x] Sign and publish; verify the protected release and actual SYSTEM Refresh/Health result 0 on DEVWKS01, DEVWKS05 and NEX-LAPTOP-01/02/03/05/06. Local DEVWKS03 refresh remains pending authorized elevated task execution; nine other members lack authenticated readback.
+- [ ] Observe actual package outcomes in the next approved maintenance window; coordinate required restarts separately.
+- [ ] Complete Azure Developer CLI native applicability diagnostics before targeted repair. Laptop 06 has a later successful User assessment on October 26, so its October 23 source error is historical; diagnose in real user context only if it recurs.
+- [ ] Finish pilot DNS/asset reconciliation. The five approved stale VPN A records were corrected November 3 and 3 + 7 day zone aging is under observation in case 255215; remaining asset ownership and reconnect registration are not complete. Do not weaken Kerberos or broaden firewall exceptions.
+
+Read-only post-boot reconciliation outside the installation window remains a
+future iteration; this release does not clear saved restart targets on deployment.
 
 ### October 16 Outcome And Launch Corrections
 
@@ -78,6 +117,30 @@ The final release manifest and replica readback are under
 No package task was forced, no processes were stopped, and no GPO actions changed.
 
 ## Final Validation
+
+November 3: all six local suites passed again, 124 checks/scenarios total; eight
+script parser checks and sample-policy JSON validation passed. All five release
+signatures remain Valid and timestamped. Fresh direct-DC/guest readback confirms
+the agent, Health and live policy hashes match the October 27 publication below.
+The domain-alias SYSVOL read failed in this operator session, despite successful
+direct DC reads; no domain-path availability or fresh endpoint acceptance is
+claimed. DNS change case 255215 remains Active for the November 13 observation
+review, with server automatic scavenging disabled.
+
+October 27: all six tracked suites passed under Windows PowerShell 5.1: 38 function,
+29 reliability, 29 fake-winget/Health, nine cache-dispatch, six pure ACL and 13
+pilot regression checks/scenarios (124 total). All five release PS1 signatures are
+Valid and timestamped with the approved domain signer. Published agent SHA256
+`14687A9AABA0F424FB8C00C407D41ACB909AEB8C3B314A51529E17AF98228D9C`
+and policy SHA256
+`5D6FA4DF387B10296B1D9A7E6DFDFF273BFC9CCCBCFB35E3492EC5813B2B8FE1`
+match the domain path, both DC replicas and all seven refreshed endpoints. GPO
+revision 22 and all 17 members are unchanged; no task payload change was needed.
+The four exact VS Code hold review dates are November 3; unchanged bad hashes stay
+held after review is overdue. Machine/User/Notification tasks and restarts were
+not forced. Next-window package behavior remains unproven by this deployment.
+Local publication, rollback, endpoint and remoting receipts are under
+`E:\Sandbox\SysOps-And-CyberSecurity\.scratch\patch-agent-fixes-20261027`.
 
 October 16 repository checkpoint: reran all five tracked suites under Windows
 PowerShell 5.1 before commit/sync: 38 function checks, 26 reliability checks,

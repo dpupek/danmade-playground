@@ -59,7 +59,8 @@ function Get-ActiveRunState {
 
 function Get-MatchingAgentProcesses {
   if (-not [string]::IsNullOrWhiteSpace($ProcessSnapshotPath)) {
-    return @(Get-Content -LiteralPath $ProcessSnapshotPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+    $snapshot = Get-Content -LiteralPath $ProcessSnapshotPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    return $snapshot
   }
 
   return @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction Stop | ForEach-Object {
@@ -102,6 +103,36 @@ function Write-HealthEvent {
       Write-EventLog -LogName Application -Source 'DanmadePatchAgent' -EventId $EventId -EntryType $type -Message ($record | ConvertTo-Json -Compress -Depth 8)
     } catch { }
   }
+}
+
+function Get-AgentLogHealth {
+  param([object[]]$Records, [object[]]$Processes, [string]$ActiveRunId)
+
+  $terminal = @('Completed', 'CompletedWithFailures', 'CompletedRestartRequired', 'NoPackagesSelected', 'DisabledByPolicy', 'SkippedOutsideMaintenanceWindow', 'PreflightFailed', 'UnhandledAgentError', 'InventoryInconclusive', 'PolicyLoadFailedNoPatching', 'MachineModeNotRunningAsSystem', 'LocalBootstrapFailed')
+  $assessed = @('Completed', 'CompletedWithFailures', 'CompletedRestartRequired', 'NoPackagesSelected')
+  $lastTerminal = $null; $lastAssessment = $null; $lastSkipped = $null
+  $incomplete = @{}
+  foreach ($record in $Records) {
+    if ((Get-PropertyValue $record 'mode') -ne 'Machine') { continue }
+    $time = [datetime]$record.timestamp
+    if ($record.status -eq 'RunStarted') { $incomplete[[string]$record.runId] = $time }
+    if ($record.status -in $terminal) {
+      if (-not $lastTerminal -or $time -gt $lastTerminal) { $lastTerminal = $time }
+      $incomplete.Remove([string]$record.runId)
+    }
+    if ($record.status -in $assessed -and (-not $lastAssessment -or $time -gt $lastAssessment)) { $lastAssessment = $time }
+    if ($record.status -eq 'SkippedOutsideMaintenanceWindow' -and (-not $lastSkipped -or $time -gt $lastSkipped)) { $lastSkipped = $time }
+  }
+  $current = @(); $historical = @()
+  foreach ($id in $incomplete.Keys) {
+    $start = $incomplete[$id]
+    $matching = @($Processes | Where-Object { [math]::Abs((([datetime]$_.CreationDate) - $start).TotalSeconds) -lt 30 })
+    # A later completed assessment plus no corresponding live identity retires old log-only warnings.
+    if ($lastAssessment -and $start -lt $lastAssessment -and $id -ne $ActiveRunId -and $matching.Count -eq 0) {
+      $historical += [pscustomobject]@{ RunId = $id; StartedAt = $start }
+    } else { $current += [pscustomobject]@{ RunId = $id; StartedAt = $start } }
+  }
+  return [pscustomobject]@{ LastTerminal = $lastTerminal; LastAssessment = $lastAssessment; LastSkipped = $lastSkipped; Incomplete = $current; HistoricalIncomplete = $historical }
 }
 
 $maxRunMinutes = Get-PolicyMaxRunMinutes
@@ -190,18 +221,13 @@ try {
 }
 
 $jsonlPath = Join-Path $LogRoot 'Events\patch-agent.jsonl'
-$terminalStatuses = @('Completed', 'CompletedWithFailures', 'CompletedRestartRequired', 'NoPackagesSelected', 'DisabledByPolicy', 'SkippedOutsideMaintenanceWindow', 'PreflightFailed', 'UnhandledAgentError', 'InventoryInconclusive', 'PolicyLoadFailedNoPatching', 'MachineModeNotRunningAsSystem', 'LocalBootstrapFailed')
-$lastTerminal = $null
-$incomplete = @{}
+$records = @()
 if (Test-Path -LiteralPath $jsonlPath) {
   foreach ($line in (Get-Content -LiteralPath $jsonlPath -Tail 3000)) {
     try {
       $record = $line | ConvertFrom-Json -ErrorAction Stop
-      if ($record.mode -eq 'Machine' -and $record.status -eq 'RunStarted') { $incomplete[[string]$record.runId] = [datetime]$record.timestamp }
-      if ($record.mode -eq 'Machine' -and $record.status -in $terminalStatuses) {
-        $lastTerminal = [datetime]$record.timestamp
-        $incomplete.Remove([string]$record.runId)
-      }
+      $null = [datetime]$record.timestamp
+      $records += $record
     } catch {
       $findings++
       Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'HealthLogRecordUnreadable' }
@@ -209,29 +235,37 @@ if (Test-Path -LiteralPath $jsonlPath) {
     }
   }
 }
-foreach ($id in $incomplete.Keys) {
-  if (($now - $incomplete[$id]).TotalMinutes -gt $maxRunMinutes) {
+$logHealth = Get-AgentLogHealth -Records $records -Processes $matches -ActiveRunId ([string](Get-PropertyValue $activeRun 'runId' ''))
+foreach ($run in $logHealth.Incomplete) {
+  if (($now - $run.StartedAt).TotalMinutes -gt $maxRunMinutes) {
     $findings++
-    Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'IncompleteAgentRunDetected'; activeRunId = $id; startedAt = $incomplete[$id]; response = 'ReportOnlyNoTermination' }
+    Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'IncompleteAgentRunDetected'; activeRunId = $run.RunId; startedAt = $run.StartedAt; response = 'ReportOnlyNoTermination' }
   }
 }
-if (-not $lastTerminal -or ($now - $lastTerminal).TotalHours -gt 26) {
+if (-not $logHealth.LastTerminal -or ($now - $logHealth.LastTerminal).TotalHours -gt 26) {
   $findings++
-  Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'AgentRunEvidenceMissing'; lastTerminalAt = $lastTerminal; thresholdHours = 26; response = 'ReportOnlyNoTermination' }
+  Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'AgentRunEvidenceMissing'; lastTerminalAt = $logHealth.LastTerminal; thresholdHours = 26; response = 'ReportOnlyNoTermination' }
+}
+if (-not $logHealth.LastAssessment -or ($now - $logHealth.LastAssessment).TotalHours -gt 26) {
+  $findings++
+  Write-HealthEvent -EventId 5601 -EntryType Warning -Fields @{ status = 'AgentAssessmentOverdue'; lastAssessmentAt = $logHealth.LastAssessment; lastSkippedAt = $logHealth.LastSkipped; thresholdHours = 26; response = 'ReportOnlyNoTermination' }
 }
 Write-HealthEvent -EventId 5002 -EntryType Information -Fields @{
   status = 'HealthCheckCompleted'
   findings = $findings
   matchingProcessCount = $matches.Count
   maxRunMinutes = $maxRunMinutes
-  lastAgentTerminalAt = $lastTerminal
+  lastAgentTerminalAt = $logHealth.LastTerminal
+  lastAssessmentAt = $logHealth.LastAssessment
+  lastSkippedAt = $logHealth.LastSkipped
+  historicalIncompleteCount = @($logHealth.HistoricalIncomplete).Count
   response = 'ReportOnlyNoTermination'
 }
 # SIG # Begin signature block
 # MIIgEQYJKoZIhvcNAQcCoIIgAjCCH/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCsXhz7vZNA6zXo
-# Nl0ySCT0d1YKv6NY01ENCoTRdUOnuqCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBeZUaO92fJiA5T
+# 8BiTQLr4bAm/x0vuyH2t88Vo33Ot+aCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -375,29 +409,29 @@ Write-HealthEvent -EventId 5002 -EntryType Information -Fields @{
 # BgoJkiaJk/IsZAEZFgduZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsAhNW
 # AAAA+7iPxuX14sCEAAEAAAD7MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcC
 # AQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYB
-# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIKKPekP3cgMP
-# PoPR+c9KwmwHO8cVGlb5ayXqq0kK+syXMA0GCSqGSIb3DQEBAQUABIIBAJkjEEec
-# 6+G+joS6y2dxud3lQh91zwD6qV5WWNJr5Q7xT2nYnOc6TY82qPECfQxGAeeF2lRc
-# /iB9xRlteUNpvsuw8mBCZGpsXb1E31WISHwhllSuRLitlqPxP691Kh3AUBDTwAHX
-# lFW/rJKCj2vxut4VLMGJXEiHE+RABVRq3w/z53ysGvc/zxnil+/875LKkN2Rg/fZ
-# 9WDYPbA2SRDk0mOkSY2CKt8a0pkD15SzCN21IhV9eu65L4ebSZ0QI6wKGktYldEg
-# EGQZo/4eqWu9IrxmpR0nG3RUSkY76uWIJleIUs4EB2UsVNFAxfOdRNS4V2dSBPjO
-# uZk8pAGh72exD5KhggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
+# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIHysfQoJzmkb
+# Rke7x9ypPfBSj7zMenjr5ikLTAlbeVw6MA0GCSqGSIb3DQEBAQUABIIBACspBWbB
+# lYBXs2M4M4SpHqegtqSCvc8aVpmSRZO4ub+6rH2YRnsriRlqUmK0Cgw3fA6IQZl7
+# fiG3V0hGCtQzMMnBw6zvZk1uwBnQi08ht2NJWDNt1sFtN+AVd86T2HXi3jVdzIT5
+# 9JMeGQgJD0wgaR94DapNjVXneShHoktogS0M/dCgZslkGsU/eRvjocw8g1EE6Rbi
+# JQF+m2HntGhEUPU5ImunKhQE3QNkFw/6KFCEnU1/A9X22dcnOdJ7ZW2/vlwL+NV+
+# jotOxHO8qdqoGv8VXX7pK54h/KH3iWyg5Ez9ZvzEEKGxp7Ppw3DTGLhI8VBNMEU+
+# tkl9ZphQKMthOpahggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
 # CQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERp
 # Z2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIw
 # MjUgQ0ExAhAIT9wzT35FTtvDD4/5khg1MA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZI
-# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYxMDE2MTczOTQ0
-# WjAvBgkqhkiG9w0BCQQxIgQgnEcRRvOCrvQaa3/0GK3WuCNpTYRpFau5/4lqFo3V
-# QaswDQYJKoZIhvcNAQEBBQAEggIASg5Lcgc5Yoqrm7CQBwjY+TerpBpUUEjfK4wh
-# 5lXvBAa6Oz7XQxs5hXfPF4GwkE1AShQ4Ww/8k7CRzCWeN8kG3fLjZ/ZMFP0IceFB
-# alYPrNweEs2SFIJ0iDhFkUTX3mkzNNtWYNJ1qa3Kq7AdvodNM2BTPXDBnYaqIVIr
-# S8/k4hiRAVvP7n4i0NLYrCKcC8Yu9U7xbLf78OxBbYQcGGcTYauKphjsIAbOYTj5
-# aIsMi9s7/ABFHaQ4ZCufHrFr5gNnsNG41E9IylRUw0cEMJQbJQN5B06k5kPUg1FY
-# UEZ783nHjBEb/F3nMsAke1+ClIQzzcimoICpZ55DmjN94InFVmANkitHUo3B3lbN
-# PlkNZvLVRS2QyUAb9j92f8VNTgbyY+oFYRvMN0JsIYrRx6N6UDoChpqPi9A4SMYY
-# XON3Uqsujlpi25X/yfVZt1RnfChPfrTgkV2UD8hf4FdwuodPYlB2gSnKxrZZ2Sgr
-# XJO8sdDAlTEZOJhUdyiGBjqorgxARBSELShOYdFX6+RsE3QijF2GCbfpv9N1gzNh
-# C7LL6hUiAIgvB5gnKNgr942i3VdsMM683WbWGNVHEluUm2YXg7tIL6Nh/TZaotZy
-# 8GgDxoUV95j6Jsn/OTLIHS/OVZQp1zhuX8hoDq5s4X7obi40cOCoL5XEYLDVQO1X
-# U+sW1oc=
+# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYxMDI3MTM1ODM2
+# WjAvBgkqhkiG9w0BCQQxIgQggNlsyP/v50ztZqRl0r2bvmOzBWnDhSYjYQzUbmcp
+# rScwDQYJKoZIhvcNAQEBBQAEggIAKgfQs+7kk8+0/20iuj1VW159ecT9AbOjJGQg
+# nrz6ebOqH4NuoVI/unr2BW0g/49ce50L0fW9Y9YVvg4mMOCTg8cgPYpuZWEA/cG/
+# nzew5AElJVXqoShOjIgDCVF2AMBB3MFgqWyxVQkqGmmrEDVQTEowGfCAO5UPKdAW
+# herl240MYTVKypLkB0He+apHTfOnQoQZRhNKT0UXSZTX2TDpEZy+qZW4GlcH7v1V
+# ubTiBczJWtsrzBkKVl9qzFD3czHnIEqk1lsHKiOA1N77i9X9KtcIvPO7isjd4rrH
+# +So2c5w7vRokcZHQH9LCArKi3BdMn8UAAv2VLP1Wg+rHIKheMPVuuqmEgfLpl/EJ
+# n9V7QEMGkkC97aDq/w+5ujHrR+JfJPv9cyVY8GayFChNpWP6BJOvuQ8a8M2+Y9hC
+# SRoqjhyrcQOhBthRdDwiDS+MUGcVF9JbkySk4/7VuRFTL0v2l395Rh2BYoc1tCYZ
+# x08/ml09wXRY3qBW+tMXurFN3tE5wPeVes1rpSMSJhls9ICbLzSmiieNASrBV4GS
+# KvAGZDFwciukVBAOOOE1w3u70DQwCfDFutgRDGKXXviszT9spDf1hALT4s2Xqa3q
+# v5DN0G932EVEpVV5e7cTO7+V5P8CbZ11306ert5eapLxrUmp6pgHA+smj92YurzB
+# 2VXfodM=
 # SIG # End signature block

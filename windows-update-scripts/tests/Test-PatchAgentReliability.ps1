@@ -66,6 +66,7 @@ foreach ($case in @(
   $count++
 }
 foreach ($case in @(
+  @{Code='8A150010';Status='NoApplicableInstaller'},
   @{Code='8A150014';Status='InstalledPackageNotFound'},
   @{Code='8A15008E';Status='InstallerTechnologyMismatch'},
   @{Code='8A15002B';Status='NoApplicableUpgrade'},
@@ -132,6 +133,20 @@ $script:ShowExit = 42
 $result = Get-PackageReleaseHold -Package $package
 Assert-Equal $result.Status 'DeferredReleaseHoldUnverified' 'Unknown metadata must not bypass hold.'
 $count += 3
+
+# Arrange / initial assert: the same bad bytes remain after the review deadline.
+$script:ShowExit = 0; $script:ProbeHash = $badHash
+$script:Policy.packageRules[0].releaseHolds[0].until = (Get-Date).AddDays(-1).ToString('o')
+Assert-Equal ([datetime]$script:Policy.packageRules[0].releaseHolds[0].until -lt (Get-Date)) $true 'Review fixture must be overdue.'
+# Act.
+$result = Get-PackageReleaseHold -Package $package
+# Assert: overdue review does not approve known-bad bytes; corrected bytes are still eligible.
+Assert-Equal $result.Status 'DeferredKnownBadRelease' 'Expired review must not release unchanged bad bytes.'
+Assert-Equal $result.ReviewOverdue $true 'Overdue review must be visible.'
+$script:ProbeHash = 'c' * 64
+$result = Get-PackageReleaseHold -Package $package
+Assert-Equal $result.Status 'Clear' 'Expired review must not block a corrected hash.'
+$count += 2
 
 $script:Policy.maintenanceWindow = [pscustomobject]@{enabled=$true;start='invalid';end='04:00';machineOnly=$true}
 $Mode = 'User'
