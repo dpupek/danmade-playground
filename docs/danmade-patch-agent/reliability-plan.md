@@ -1,6 +1,6 @@
 # Patch Agent Reliability Hardening
 
-Date: 2026-11-06
+Date: 2026-11-18
 
 Operator Level: Windows-first beginner operator (little Windows domain experience and no Linux experience)
 
@@ -17,6 +17,19 @@ dependency. The current inventory reader can mistake failure for an empty list,
 and unavailable policy falls back to broad defaults.
 
 ## Iterations
+
+### November 18 Application Activation, Refresh Health And Zoom
+
+Baseline: explicit WinGet application-restart output falls through to immediate
+verification; Health ignores refresh-task failures until cache expiration; Zoom's
+compound version cannot be parsed for OS restart reconciliation.
+
+- [x] Persist user activation state and verify the exact target without forcing applications closed. An exact same-target deferral lasts seven days and does not require a Windows reboot. Expiry logs an administrator warning, then allows normal selection again.
+- [x] Add report-only refresh result and cache age monitoring, with advance warning beginning at day five. Laptop 03's November 18 refresh finished successfully and verified the valid signed November 4 cache at 09:55 Central. Its earlier launch failure's cause remains unknown; no task, cache or trust change was needed.
+- [x] Compare only supported Zoom build formats and separate post-reboot review from the reboot prompt. The laptop 02 User profile with the pending Zoom record had a later boot and one exact uninstall registration at the recorded target `7.2.5 (51704)`. No state was cleared on the endpoint.
+- [x] Pass all seven Windows PowerShell 5.1 suites (194 checks/scenarios), five changed-script parser checks and Markdown/whitespace checks. Fixture success does not substitute for live SYSTEM or endpoint acceptance.
+- [x] Sign and publish the agent, Health and Notification together to the existing pilot. At 10:44 Central on November 18, both DCs and the domain alias validated all three approved timestamped signatures and artifact hashes. No change to policy, group, GPO, other payloads, ACLs or maintenance hours. The signed candidate is retained with the manifest and verified backups under `.scratch\pilot-activation-20261118-104431-c2cf083a`; the source tree retains the reviewed unsigned input.
+- [ ] After natural adoption, confirm app reopen and Main-version proof, fresh refresh Health readback and Zoom state reconciliation on the next User assessment. If laptop 03's launch failure recurs, capture exact SYSTEM startup evidence before making an endpoint change.
 
 ### November 6 Read-Only Acceptance Review
 
@@ -290,6 +303,16 @@ The final release manifest and replica readback are under
 No package task was forced, no processes were stopped, and no GPO actions changed.
 
 ## Final Validation
+
+November 18 local candidate: 194 checks/scenarios pass. Coverage exercises healthy Main
+versus stale/bundle-only evidence, expiry, the notification preview, post-boot
+Zoom proof and report-only refresh results and cache aging. Fake-WinGet tests
+cover the observed app-restart message and suppressing the next same-target
+attempt. Laptop 03 and Zoom endpoint observations are from read-only checks
+against the existing release, not acceptance of the new signed payload. Publication
+to both DCs is verified, but five sampled endpoints still had their previous
+cache at both 10:47 and 10:56 Central. Overnight Refresh/Health/Machine and the subsequent
+User and Notification runs must be correlated to adoption before acceptance.
 
 November 6 read-only validation: seven of eight readable caches are on the latest
 release, all eight signatures are Valid and both DC publication hashes still

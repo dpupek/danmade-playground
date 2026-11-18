@@ -111,7 +111,7 @@ public static class FakeWinget
         if (!string.IsNullOrWhiteSpace(statePath)) { File.WriteAllText(statePath, listCount.ToString()); }
         if (scenario == "InventoryFailure") { Console.WriteLine("Source unavailable"); return 42; }
         if (scenario == "VerificationMalformed" && listCount > 1) { Console.WriteLine("{\"unexpectedSchema\":[]}"); return 0; }
-        if (scenario != "StillOffered" && scenario != "NoApplicableUpgrade" && scenario != "NoApplicableInstaller" && listCount > 1) { Console.WriteLine("[]"); return 0; }
+        if (scenario != "StillOffered" && scenario != "NoApplicableUpgrade" && scenario != "NoApplicableInstaller" && scenario != "ApplicationRestart" && listCount > 1) { Console.WriteLine("[]"); return 0; }
         Console.WriteLine("[{\"PackageIdentifier\":\"" + Escape(packageId) + "\",\"PackageName\":\"" + Escape(packageName) + "\",\"InstalledVersion\":\"" + Escape(installedVersion) + "\",\"AvailableVersion\":\"" + Escape(availableVersion) + "\",\"Source\":\"" + source + "\"}]");
         return 0;
       }
@@ -121,6 +121,7 @@ public static class FakeWinget
         string logPath = args[logIndex + 1];
         Directory.CreateDirectory(Path.GetDirectoryName(logPath));
         if (scenario == "InstalledPackageNotFound") { Console.WriteLine("No installed package found matching input criteria."); return unchecked((int)0x8A150014); }
+        if (scenario == "ApplicationRestart") { Console.WriteLine("Successfully installed. Restart the application to complete the upgrade."); return 0; }
         if (scenario == "NoApplicableInstaller") { Console.WriteLine("No applicable installer found; see logs for more details."); return unchecked((int)0x8A150010); }
         if (scenario == "NativeRestart") { Console.WriteLine("Restart your PC to finish installation."); return unchecked((int)0x8A150109); }
         if (scenario == "BurnRestart") { File.WriteAllText(logPath,"[BF38:78F0]i007: Exit code: 0xbc2, restarting: No"); Console.WriteLine("Restart your PC to finish installation."); return 0; }
@@ -512,6 +513,31 @@ Assert-True (@($noApplicable.Events | Where-Object { $_.status -eq 'Completed' -
 $cachedTerminals = @($noApplicableCached.Events | Where-Object { $_.status -eq 'Completed' })
 Assert-True ($cachedTerminals.Count -eq 2) 'The reused log must contain the original and cached assessments.'
 Assert-True ($cachedTerminals[-1].applicabilityDeferredCount -eq 1 -and $cachedTerminals[-1].coverageStatus -eq 'UnresolvedOffers') 'The latest cached applicability assessment must retain its own deferral count.'
+
+# Arrange and initial assert: an older agent left a false failure for the same target.
+$activationRoot = Join-Path $runRoot 'app-restart'
+$activationPath = Join-Path $activationRoot 'agent\State\pending-application-restart.json'
+$legacyNotice = Join-Path $activationRoot 'agent\State\pending-notification.json'
+$null = New-Item -ItemType Directory -Path (Split-Path $legacyNotice) -Force
+@{status='CompletedWithFailures';summary=@{failed=1;restartRequired=0};restartRequiredPackages=@();failedPackages=@(@{id='Microsoft.WindowsTerminal';name='Windows Terminal';source='winget';available='1.1.0'})} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $legacyNotice
+Assert-True (-not (Test-Path -LiteralPath $activationPath)) 'The activation fixture must start empty.'
+Assert-True (Test-Path -LiteralPath $legacyNotice) 'The legacy same-target failure must exist.'
+# Act.
+$activation = Invoke-AgentScenario -Name 'app-restart' -Mode User -Scenario ApplicationRestart -PackageId 'Microsoft.WindowsTerminal' -PackageName 'Windows Terminal' -ScenarioRoot $activationRoot
+# Assert: do not immediately verify stale inventory, fail, or request an OS reboot.
+Assert-True ($activation.ExitCode -eq 0 -and (Test-Path -LiteralPath $activationPath)) 'Activation must persist without failure.'
+Assert-True (@($activation.Calls | Where-Object { $_.Args -contains '--id' }).Count -eq 1) 'Activation must run only the original install, not immediate verification.'
+Assert-True (@($activation.Events | Where-Object { $_.status -eq 'Completed' -and $_.applicationRestartPendingCount -eq 1 -and -not $_.restartRequired -and $_.failedCount -eq 0 -and $_.coverageStatus -eq 'UnresolvedOffers' }).Count -eq 1) 'Activation must remain unresolved without OS restart or failure.'
+Assert-True (-not (Test-Path -LiteralPath $legacyNotice)) 'Activation must replace the same-target false failure without creating a Windows restart notice.'
+
+# Arrange and initial assert: reuse the same user state with the same offer.
+$activationRecord = (Get-Content -LiteralPath $activationPath -Raw | ConvertFrom-Json).packages[0]
+Assert-True ($activationRecord.runId -eq 'app-restart' -and $activationRecord.available -eq '1.1.0') 'The original target and notification identity must be stored.'
+# Act.
+$activationRepeat = Invoke-AgentScenario -Name 'app-restart-repeat' -Mode User -Scenario ApplicationRestart -PackageId 'Microsoft.WindowsTerminal' -PackageName 'Windows Terminal' -ScenarioRoot $activationRoot
+# Assert.
+Assert-True ($activationRepeat.ExitCode -eq 0 -and @($activationRepeat.Calls | Where-Object { $_.Args -contains '--id' }).Count -eq 0) 'A pending same-target offer must not install again.'
+Assert-True (((Get-Content -LiteralPath $activationPath -Raw | ConvertFrom-Json).packages[0]).runId -eq 'app-restart') 'Reassessment must not reset the notification identity.'
 Assert-True (@($native.Calls | Where-Object { $_.Args -contains '--log' }).Count -eq 0) 'Native updater must not invoke winget installer.'
 foreach ($fixture in @(@{Scenario='ReleaseHold';Status='DeferredKnownBadRelease';Attempts=0},@{Scenario='ReleaseHoldUnreadable';Status='DeferredReleaseHoldUnverified';Attempts=0},@{Scenario='ReleaseHoldCorrected';Status='Succeeded';Attempts=1})) {
   $rule = [pscustomobject]@{id='Test.Held';mode='Auto';releaseHolds=@([pscustomobject]@{version='1.1.0';scope='user';installerSha256=('a'*64);until=(Get-Date).AddDays(7).ToString('o');reason='Bad fixture'})}

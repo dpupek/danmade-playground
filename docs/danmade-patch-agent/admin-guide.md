@@ -1,6 +1,6 @@
 # Danmade Patch Agent Admin Guide
 
-Date: 2026-11-04
+Date: 2026-11-18
 
 Operator Level: Windows-first beginner operator (little Windows domain experience and no Linux experience)
 
@@ -105,7 +105,17 @@ The agent verifies only a confirmed completed upgrade using read-only scope-filt
 
 Winget can return exit code `0` while its command output describes a failed acquisition. HTTP 5xx download failures are recorded as `TransientDownloadFailure`, retried only within the existing `maxRetries` budget, and never sent to inventory verification. The event includes the download URL, HTTP status/HRESULT-derived status, and the package attempt evidence path. A `No applicable upgrade found` result is recorded as `DeferredNoApplicableUpgrade`, not a failed update; its saved evidence captures the installed and available versions, source, and diagnostic output reference. Repeated runs record `DeferredNoApplicableUpgradeCached` until either those values change or the deferral expires.
 
-When an installer reports `3010` or `1641`, emits an explicit restart-required message, or introduces a new reboot marker, the agent records `RestartRequiredPendingVerification`. It writes the normal pending user-notification state and durable restart-verification state under `State\pending-restart-verification.json`. On the first run after reboot, the agent re-lists the package inventory before attempting the package again. It records `RestartVerificationResolved` only if the package is no longer offered; a package still offered after reboot becomes `RestartVerificationFailedStillOffered`.
+When an installer reports `3010` or `1641`, emits an explicit Windows restart-required message, or introduces a new reboot marker, the agent records `RestartRequiredPendingVerification`. It writes the normal pending user-notification state and durable restart-verification state under `State\pending-restart-verification.json`. After reboot the agent requires positive same-scope installed-target evidence; an absent offer alone is not proof. An exact, same-scope offer still below the recorded target fails verification. Inconclusive evidence stays pending for administrator review without telling the user to reboot again.
+
+For a successful User upgrade with WinGet's explicit application restart message,
+the agent records `ApplicationRestartPendingVerification` in
+`State\pending-application-restart.json`. The notification asks the user to save
+work, close the app and reopen it. It neither terminates processes nor requests
+a Windows restart. The same user, package, source and target are not retried for
+seven days. On a subsequent assessment, a pinned AppX package needs a unique
+healthy current-user Main registration at the target or newer; disappearance
+from the upgrade list is not enough. Unproven records expire with an administrator
+warning and normal eligibility rules resume. A new target is evaluated separately.
 
 Each package attempt writes a JSON evidence record under `Logs\` with the Winget output, structured command and installer outcomes, selected installer type, and before/after reboot-marker snapshots. The installer parser honors final MSI success markers such as `Installation completed successfully` and `Installation success or error status: 0`; a continued custom-action error is not a terminal MSI failure. Genuine terminal installer `1603` and `1605` results remain failures. The agent does not treat generic, pre-existing pending file-renames as proof that a package requires a restart.
 
@@ -326,7 +336,7 @@ C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
 -NoProfile -NonInteractive -ExecutionPolicy AllSigned -File "C:\ProgramData\DanmadePatchAgent\Package\Invoke-DanmadePatchAgentCached.ps1" -Mode Health
 ```
 
-The health task reads `maxRunMinutes`, active-run state, task results, and bounded recent logs. It recognizes direct agent and cached-bootstrap Machine processes. It records `HealthCheckCompleted`, `StaleAgentProcessDetected`, `OrphanedActiveRunDetected`, `AgentTaskNeedsReview`, and `AgentRunEvidenceMissing` (no terminal record within 26 hours). These are report-only: no termination or task disabling. An absent health heartbeat is not proof of health.
+The health task reads `maxRunMinutes`, active-run state, task results, and bounded recent logs. It recognizes direct agent and cached-bootstrap Machine processes. It records `HealthCheckCompleted`, `StaleAgentProcessDetected`, `OrphanedActiveRunDetected`, `AgentTaskNeedsReview`, and `AgentRunEvidenceMissing` (no terminal record within 26 hours). It reports completed refresh failures as `CacheRefreshTaskFailed`, cache verification age from five days as `LocalPolicyVerificationAging`, and invalid/expired verification as `LocalPolicyRefreshRequired`. A running/queued refresh is not a completed failure. These are report-only: no termination, cache repair or task changes. An absent health heartbeat is not proof of health.
 
 ## User Scheduled Task GPO
 
@@ -476,7 +486,10 @@ an exact unique same-scope uninstall registration, or a policy-pinned current-us
 AppX registration can supply version evidence. Ambiguous or unknown versions retain
 pending state as `RestartVerificationInconclusive`, requiring administrator review.
 Do not clear that state manually or ask users to reboot repeatedly without reviewing
-the evidence. A positively identified older version still offered after reboot
+the evidence. A run with only post-reboot verification still pending reports
+`CompletedRestartVerificationInconclusive` without an OS restart request. Zoom
+EXE target comparison accepts `x.y.z (build)` and the equivalent `x.y.z.build`,
+but does not infer a missing build. A positively identified older version still offered after reboot
 remains `RestartVerificationFailedStillOffered`. Immediate post-install inventory
 verification remains separate and unchanged.
 

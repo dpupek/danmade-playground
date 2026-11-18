@@ -41,6 +41,7 @@ $Mode = 'Machine'; $LogRoot = $scratch; $script:IsSystem = $false
 $script:Policy = New-DefaultPolicy
 $script:Entries = @(); $script:Appx = @(); $script:AppxFails = $false; $script:AppxCalls = 0
 $script:CachedUserAppxPackages = $null; $script:ApplicabilityDeferredCount = 0
+$script:InapplicableUpgradeStatePath = Join-Path $scratch 'State\inapplicable-upgrades.json'
 $script:Events = New-Object 'System.Collections.Generic.List[object]'
 $count = 0
 
@@ -302,4 +303,129 @@ try { $null=Import-AgentPolicy } catch { $rejected=$true }
 # Assert.
 Assert-Equal $rejected $true 'Scalar family policy must fail closed.'
 $count++
+foreach ($case in @(
+  @{Installed='7.2.5 (51704)';Scope='CURRENT_USER';Expected=$true},
+  @{Installed='7.2.5.51704';Scope='CURRENT_USER';Expected=$true},
+  @{Installed='7.2.5 (51703)';Scope='CURRENT_USER';Expected=$false},
+  @{Installed='7.2.5';Scope='CURRENT_USER';Expected=$false},
+  @{Installed='7.2.5 (51704) extra';Scope='CURRENT_USER';Expected=$false},
+  @{Installed='7.2.5 (51704)';Scope='LOCAL_MACHINE';Expected=$false}
+)) {
+  # Arrange / Initial Assert.
+  $zoom = [pscustomobject]@{id='Zoom.Zoom.EXE';name='Test App';source='winget';available='7.2.5 (51704)'}
+  $script:Entries = @(New-Registration $case.Scope $case.Installed)
+  Assert-Equal $script:Entries[0].DisplayVersion $case.Installed 'Raw installed evidence must be retained.'
+  # Act.
+  $proved = Test-RecordedTargetInstalled $zoom @()
+  # Assert.
+  Assert-Equal $proved $case.Expected "Zoom target proof: $($case.Installed) / $($case.Scope)."
+  $count++
+}
+
+# Arrange: a real reboot occurred, but installed target evidence is inconclusive.
+$zoom | Add-Member NoteProperty bootTimeAtDetection '2026-11-01'
+$zoom | Add-Member NoteProperty evidencePath 'saved-zoom-attempt.json'
+$script:Entries = @()
+@{packages=@($zoom)} | ConvertTo-Json -Depth 5 | Set-Content $statePath
+$noticePath = Get-NotificationStatePath
+$other = [pscustomobject]@{id='Test.Unrelated';source='winget';available='2.0.0'}
+@{status='CompletedRestartRequired';failedPackages=@();restartRequiredPackages=@($zoom,$other);summary=@{failed=0;restartRequired=2}} | ConvertTo-Json -Depth 5 | Set-Content $noticePath
+$review = Resolve-PendingRestartVerification @()
+Assert-Equal $review.ReviewPackages.Count 1 'Zoom should require post-reboot review.'
+# Act.
+Resolve-RecordedPackageState -AvailablePackages @() -ReviewRestartPackages $review.ReviewPackages
+# Assert.
+$notice = Get-Content -LiteralPath $noticePath -Raw | ConvertFrom-Json
+Assert-Equal $notice.restartRequiredPackages.Count 1 'Only the exact post-reboot notice should be removed.'
+Assert-Equal $notice.restartRequiredPackages[0].id $other.id 'Unrelated reboot notice must be retained.'
+Assert-Equal (Test-Path $statePath) $true 'Admin evidence must remain pending.'
+$count++
+
+# Arrange / Initial Assert: reproduce laptop 02's exact registration after reboot.
+$script:Entries = @(New-Registration CURRENT_USER '7.2.5 (51704)')
+$script:Events.Clear()
+Assert-Equal (Test-Path $statePath) $true 'Previously inconclusive Zoom record must still exist.'
+# Act.
+$zoomRecheck = Resolve-PendingRestartVerification @()
+# Assert.
+Assert-Equal ($zoomRecheck.ResolvedPackageIds -join ',') 'Zoom.Zoom.EXE' 'The exact build should resolve the record.'
+Assert-Equal (Test-Path $statePath) $false 'Proven Zoom target should clear pending verification.'
+Assert-Equal $script:Events[0].status 'RestartVerificationResolved' 'Zoom resolution evidence is missing.'
+$count++
+
+$script:Policy = New-DefaultPolicy
+$script:Policy.packageRules = @(Convert-ToPackageRules @([pscustomobject]@{id='Test.App';mode='Auto';appxPackageFamilyNames=@($family)}))
+$script:IsSystem = $false
+foreach ($case in @(
+  @{Name='current Main';Version='1.1.0';Bundle=$false;Days=1;Count=0;Status='ApplicationRestartVerificationResolved'},
+  @{Name='stale Main';Version='1.0.0';Bundle=$false;Days=1;Count=1;Status=''},
+  @{Name='bundle only';Version='9.1.0';Bundle=$true;Days=1;Count=1;Status=''},
+  @{Name='expired';Version='1.0.0';Bundle=$false;Days=-1;Count=0;Status='ApplicationRestartVerificationExpired'}
+)) {
+  # Arrange / Initial Assert.
+  $script:CachedUserAppxPackages = $null
+  $script:AppxFails = $false
+  $script:Appx = @([pscustomobject]@{Status=0;IsFramework=$false;IsResourcePackage=$false;IsBundle=$case.Bundle;PackageFamilyName=$family;Version=$case.Version})
+  $script:Events.Clear()
+  $pendingPath = Get-ApplicationRestartStatePath
+  $app = [pscustomobject]@{id='Test.App';name='Test App';source='winget';available='1.1.0';evidencePath='fixture';runId='original';expiresAt=(Get-Date).AddDays($case.Days).ToString('o')}
+  @{packages=@($app)} | ConvertTo-Json -Depth 5 | Set-Content $pendingPath
+  Assert-Equal @(Get-ApplicationRestartState).Count 1 'Pending application evidence must exist.'
+  # Act: no offer is not by itself installed proof.
+  $left = @(Resolve-PendingApplicationRestart @())
+  # Assert.
+  Assert-Equal $left.Count $case.Count $case.Name
+  Assert-Equal (Test-Path $pendingPath) ($case.Count -gt 0) 'Activation state persistence mismatch.'
+  Assert-Equal (($script:Events | ForEach-Object { $_.status }) -join ',') $case.Status 'Activation evidence mismatch.'
+  $count++
+}
+
+# Arrange / Initial Assert: one current activation in a disposable user profile state directory.
+$app.expiresAt = (Get-Date).AddDays(1).ToString('o')
+@{packages=@($app)} | ConvertTo-Json -Depth 5 | Set-Content $pendingPath
+Assert-Equal (Test-Path $pendingPath) $true 'Notification fixture is missing.'
+# Act: preview the actual notification without showing a popup or acknowledging it.
+$notifier = Join-Path $repo 'windows-update-scripts\Show-DanmadePatchAgentNotification.ps1'
+$preview = @(& $notifier -MachineStatePath (Join-Path $scratch 'absent.json') -UserStatePath $noticePath -AckRoot (Join-Path $scratch 'acks') -WhatIf)
+# Assert.
+$applicationPreview = @($preview | Where-Object { $_.PSObject.Properties['Title'] -and $_.Title -eq 'Reopen an application to finish updating' })
+Assert-Equal $applicationPreview.Count 1 'Application notice missing.'
+Assert-Equal ($applicationPreview[0].Message -match 'close and reopen') $true 'Notice must request an application reopen.'
+Assert-Equal (Test-Path (Join-Path $scratch 'acks')) $false 'Preview must not acknowledge.'
+$count++
+
+foreach ($case in @(
+  @{Name='failed-and-aging';AgeHours=125;State='Ready';Result=4294770688;Failed=1;Aging=1;Expired=0},
+  @{Name='running-with-old-result';AgeHours=2;State='Running';Result=4294770688;Failed=0;Aging=0;Expired=0},
+  @{Name='healthy';AgeHours=1;State='Ready';Result=0;Failed=0;Aging=0;Expired=0},
+  @{Name='expired';AgeHours=169;State='Ready';Result=0;Failed=0;Aging=0;Expired=1},
+  @{Name='not-yet-run';AgeHours=1;State='Ready';Result=267011;Failed=0;Aging=0;Expired=0}
+)) {
+  # Arrange / Initial Assert: the cached Health script uses a synthetic parent pointer and tasks.
+  $root = Join-Path $scratch $case.Name
+  $release = Join-Path $root 'release'
+  New-Item -ItemType Directory -Path $release -Force | Out-Null
+  $health = Join-Path $release 'Test-DanmadePatchAgentHealth.ps1'
+  Copy-Item -LiteralPath (Join-Path $repo "windows-update-scripts\Test-DanmadePatchAgentHealth.ps1") -Destination $health
+  @{verifiedAt=(Get-Date).AddHours(-$case.AgeHours).ToString('o')} | ConvertTo-Json | Set-Content (Join-Path $root 'current.json')
+  $taskPath = Join-Path $root 'tasks.json'
+  $processPath = Join-Path $root 'processes.json'
+  @{Name='Danmade Patch Agent - Refresh Local Cache';State=$case.State;LastTaskResult=$case.Result;LastRunTime=(Get-Date).ToString('o')} | ConvertTo-Json | Set-Content $taskPath
+  '[]' | Set-Content $processPath
+  $healthLog = Join-Path $root 'Events\patch-agent.jsonl'
+  Assert-Equal (Test-Path $healthLog) $false 'Health fixture must start without log history.'
+  # Act.
+  & $health -LogRoot $root -ProcessSnapshotPath $processPath -TaskSnapshotPath $taskPath
+  # Assert.
+  $events = @(Get-Content -LiteralPath $healthLog | ForEach-Object { $_ | ConvertFrom-Json })
+  Assert-Equal @($events | Where-Object status -eq 'CacheRefreshTaskFailed').Count $case.Failed "$($case.Name): completed refresh failure."
+  Assert-Equal @($events | Where-Object status -eq 'LocalPolicyVerificationAging').Count $case.Aging "$($case.Name): early aging warning."
+  Assert-Equal @($events | Where-Object status -eq 'LocalPolicyRefreshRequired').Count $case.Expired "$($case.Name): expired cache warning."
+  if ($case.Failed) {
+    $failure = $events | Where-Object status -eq 'CacheRefreshTaskFailed'
+    Assert-Equal $failure.lastTaskResult $case.Result 'Preserve scheduler result.'
+    Assert-Equal $failure.response 'ReportOnlyNoTermination' 'Health may only report.'
+  }
+  $count++
+}
 Write-Output "Passed $count coverage and installed-target regression scenarios. Artifacts: $scratch"

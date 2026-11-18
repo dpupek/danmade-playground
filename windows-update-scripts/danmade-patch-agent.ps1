@@ -405,6 +405,72 @@ function Get-RestartVerificationStatePath {
   return (Join-Path -Path $LogRoot -ChildPath 'State\pending-restart-verification.json')
 }
 
+function Get-ApplicationRestartStatePath {
+  return (Join-Path -Path $LogRoot -ChildPath 'State\pending-application-restart.json')
+}
+
+function Get-ApplicationRestartState {
+  if ($Mode -ne 'User') { return }
+  $path = Get-ApplicationRestartStatePath
+  if (Test-Path -LiteralPath $path) {
+    $state = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    return $state.packages
+  }
+}
+
+function Save-ApplicationRestartState {
+  param([object[]]$Packages)
+  if ($WhatIfPreference) { return }
+  $path = Get-ApplicationRestartStatePath
+  if ($Packages.Count -gt 0) {
+    @{ schemaVersion = '1.0'; packages = @($Packages) } | ConvertTo-Json -Depth 8 | Write-AtomicJson -Path $path
+  } elseif (Test-Path -LiteralPath $path) {
+    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+  }
+}
+
+function Test-SameRecordedTarget {
+  param([object]$Recorded, [object]$Package)
+  if ($null -eq $Recorded -or $null -eq $Package) { return $false }
+  return ($Recorded.id -eq $Package.Id -and $Recorded.source -eq $Package.Source -and $Recorded.available -eq $Package.Available)
+}
+
+function Add-PendingApplicationRestart {
+  param([object]$Package, [string]$EvidencePath)
+  $entries = @(Get-ApplicationRestartState | Where-Object { -not (Test-SameRecordedTarget $_ $Package) })
+  $entries += [pscustomobject]@{
+    id = [string]$Package.Id; name = [string]$Package.Name; source = [string]$Package.Source
+    available = [string]$Package.Available; evidencePath = $EvidencePath
+    runId = $script:RunId; expiresAt = (Get-Date).AddDays(7).ToString('o')
+  }
+  Save-ApplicationRestartState -Packages $entries
+}
+
+function Resolve-PendingApplicationRestart {
+  param([object[]]$AvailablePackages)
+  $pending = @(Get-ApplicationRestartState)
+  $now = Get-Date
+  $remaining = @(foreach ($entry in $pending) {
+    $rule = Get-PackageRule -PackageId $entry.id
+    $targetSatisfied = if (@(Get-PropertyValue $rule 'appxPackageFamilyNames' @()).Count) {
+      # A pinned AppX target requires positive current-user Main registration evidence.
+      $main = @(Get-MatchingUserAppxPackages -Package $entry)
+      $main.Count -eq 1 -and (Compare-RecordedPackageVersion $entry.id ([string]$main[0].Version) $entry.available) -in @(0, 1)
+    } else {
+      Test-RecordedTargetInstalled -Package $entry -AvailablePackages $AvailablePackages
+    }
+    if ($targetSatisfied) {
+      Write-AgentEvent -EventId 5100 -EntryType Information -Fields @{ packageId = $entry.id; status = 'ApplicationRestartVerificationResolved'; available = $entry.available; source = $entry.source; evidencePath = $entry.evidencePath } | Out-Null
+    } elseif ([datetimeoffset]$entry.expiresAt -le $now) {
+      Write-AgentEvent -EventId 5601 -EntryType Warning -Fields @{ packageId = $entry.id; status = 'ApplicationRestartVerificationExpired'; available = $entry.available; source = $entry.source; evidencePath = $entry.evidencePath; requiresAdminRemediation = $true } | Out-Null
+    } else {
+      $entry
+    }
+  })
+  if ($remaining.Count -ne $pending.Count) { Save-ApplicationRestartState -Packages $remaining }
+  return $remaining
+}
+
 function Write-ActiveRunState {
   if ($WhatIfPreference -or [string]::IsNullOrWhiteSpace($script:ActiveRunStatePath)) { return }
 
@@ -668,7 +734,8 @@ function Resolve-PendingRestartVerification {
   $deferred = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
   $failed = New-Object System.Collections.Generic.List[object]
   $resolved = New-Object System.Collections.Generic.List[string]
-  if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{ DeferredPackageIds = @(); FailedPackages = @(); ResolvedPackageIds = @(); PendingRestartCount = 0 } }
+  $review = New-Object System.Collections.Generic.List[object]
+  if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{ DeferredPackageIds = @(); FailedPackages = @(); ResolvedPackageIds = @(); ReviewPackages = @(); PendingRestartCount = 0 } }
 
   try {
     $pendingState = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -687,14 +754,9 @@ function Resolve-PendingRestartVerification {
       continue
     }
     $targetSatisfied = Test-RecordedTargetInstalled -Package $entry -AvailablePackages $AvailablePackages
-    $offers = @($AvailablePackages | Where-Object { $_.Id -eq $entry.id -and $_.Source -eq $entry.source -and (Get-PropertyValue $_ 'InstallScope' '') -eq $Mode })
-    $target = $null
-    $belowTarget = @($offers | Where-Object {
-      $installed = $null
-      [version]::TryParse([string]$entry.available, [ref]$target) -and [version]::TryParse([string]$_.Installed, [ref]$installed) -and $installed -lt $target
-    })
-    if (-not $targetSatisfied -and $belowTarget.Count -eq 1 -and $offers.Count -eq 1) {
-      $failedPackage = $belowTarget[0]
+    $offers = @($AvailablePackages | Where-Object { $_.Id -eq $entry.id -and $_.Source -eq $entry.source })
+    if (-not $targetSatisfied -and $offers.Count -eq 1 -and (Get-PropertyValue $offers[0] 'InstallScope' '') -eq $Mode -and (Compare-RecordedPackageVersion $entry.id $offers[0].Installed $entry.available) -eq -1) {
+      $failedPackage = $offers[0]
       $failed.Add($failedPackage)
       [void]$deferred.Add([string]$entry.id)
       Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{ packageId = [string]$entry.id; status = 'RestartVerificationFailedStillOffered'; evidencePath = [string]$entry.evidencePath } | Out-Null
@@ -704,6 +766,7 @@ function Resolve-PendingRestartVerification {
     } else {
       [void]$deferred.Add([string]$entry.id)
       $remaining.Add($entry)
+      $review.Add($entry)
       Write-AgentEvent -EventId 5601 -EntryType Warning -Fields @{ packageId = [string]$entry.id; status = 'RestartVerificationInconclusive'; requiresAdminRemediation = $true; reason = 'InstalledTargetNotProvenAfterReboot'; evidencePath = [string]$entry.evidencePath } | Out-Null
     }
   }
@@ -716,21 +779,35 @@ function Resolve-PendingRestartVerification {
     DeferredPackageIds = @($deferred | ForEach-Object { [string]$_ })
     FailedPackages     = @($failed | ForEach-Object { $_ })
     ResolvedPackageIds  = @($resolved | ForEach-Object { $_ })
+    ReviewPackages      = $review.ToArray()
     PendingRestartCount = $remaining.Count
   }
 }
 
+function Compare-RecordedPackageVersion {
+  param([string]$PackageId, [string]$Installed, [string]$Target)
+  if ($PackageId -eq 'Zoom.Zoom.EXE' -and ($Installed -match '[()]' -or $Target -match '[()]')) {
+    # Zoom exposes the same build as x.y.z (build) or x.y.z.build. Require both builds.
+    if ($Installed -notmatch '^\d+\.\d+\.\d+(?:\.\d+| \(\d+\))$' -or $Target -notmatch '^\d+\.\d+\.\d+(?:\.\d+| \(\d+\))$') { return $null }
+    $Installed = $Installed -replace ' \((\d+)\)$', '.$1'
+    $Target = $Target -replace ' \((\d+)\)$', '.$1'
+  }
+  $installedVersion = $null
+  $targetVersion = $null
+  if ([version]::TryParse($Installed, [ref]$installedVersion) -and [version]::TryParse($Target, [ref]$targetVersion)) {
+    return $installedVersion.CompareTo($targetVersion)
+  }
+  return $null
+}
+
 function Test-RecordedTargetInstalled {
   param([object]$Package, [object[]]$AvailablePackages)
-  $target = $null
-  if (-not [version]::TryParse([string]$Package.available, [ref]$target)) { return $false }
   $matchedOffer = $false
   $offers = @($AvailablePackages | Where-Object { $_.Id -eq $Package.id -and $_.Source -eq $Package.source })
   if ($offers.Count -gt 1) { return $false }
   foreach ($offer in $offers) {
     $matchedOffer = $true
-    $installed = $null
-    if ((Get-PropertyValue $offer 'InstallScope' '') -eq $Mode -and [version]::TryParse([string]$offer.Installed, [ref]$installed) -and $installed -ge $target) { return $true }
+    if ((Get-PropertyValue $offer 'InstallScope' '') -eq $Mode -and (Compare-RecordedPackageVersion $Package.id $offer.Installed $Package.available) -in @(0, 1)) { return $true }
   }
   if ($matchedOffer) { return $false }
   # Absence from the upgrade list alone is not proof: require an exact, unique ARP name and scope.
@@ -738,16 +815,15 @@ function Test-RecordedTargetInstalled {
   if (-not $name) { return $false }
   $entries = @(Get-CachedUninstallEntries | Where-Object { $_.DisplayNameNorm -eq $name })
   if ($entries.Count -gt 1) { return $false }
-  $installed = $null
   if ($entries.Count -eq 1) {
-    return ((Get-ScopeFromEntry $entries[0]) -eq $Mode -and [version]::TryParse([string]$entries[0].DisplayVersion, [ref]$installed) -and $installed -ge $target)
+    return ((Get-ScopeFromEntry $entries[0]) -eq $Mode -and (Compare-RecordedPackageVersion $Package.id $entries[0].DisplayVersion $Package.available) -in @(0, 1))
   }
   $appx = @(Get-MatchingUserAppxPackages -Package $Package)
-  return ($appx.Count -eq 1 -and [version]::TryParse([string]$appx[0].Version, [ref]$installed) -and $installed -ge $target)
+  return ($appx.Count -eq 1 -and (Compare-RecordedPackageVersion $Package.id ([string]$appx[0].Version) $Package.available) -in @(0, 1))
 }
 
 function Resolve-RecordedPackageState {
-  param([object[]]$AvailablePackages, [string[]]$ResolvedRestartIds)
+  param([object[]]$AvailablePackages, [string[]]$ResolvedRestartIds, [object[]]$ReviewRestartPackages, [object[]]$ApplicationRestartPackages)
   if ($WhatIfPreference) { return }
   $script:CachedUninstallEntries = $null
   $script:CachedUserAppxPackages = $null
@@ -757,8 +833,13 @@ function Resolve-RecordedPackageState {
       $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
       $previousFailed = @(Get-PropertyValue -Object $state -Name 'failedPackages' -Default @())
       $previousRestart = @(Get-PropertyValue -Object $state -Name 'restartRequiredPackages' -Default @())
-      $failed = @($previousFailed | Where-Object { -not (Test-RecordedTargetInstalled -Package $_ -AvailablePackages $AvailablePackages) })
-      $restart = @($previousRestart | Where-Object { $_.id -notin $ResolvedRestartIds })
+      $failed = @(foreach ($entry in $previousFailed) {
+        if (-not @($ApplicationRestartPackages | Where-Object { Test-SameRecordedTarget $entry $_ }).Count -and -not (Test-RecordedTargetInstalled -Package $entry -AvailablePackages $AvailablePackages)) { $entry }
+      })
+      $restart = @(foreach ($entry in $previousRestart) {
+        # After a reboot, an inconclusive target is administrator evidence, not another reboot request.
+        if ($entry.id -notin $ResolvedRestartIds -and -not @($ReviewRestartPackages | Where-Object { Test-SameRecordedTarget $entry $_ }).Count) { $entry }
+      })
       if ($failed.Count -ne $previousFailed.Count -or $restart.Count -ne $previousRestart.Count) {
         $state.failedPackages = $failed
         $state.restartRequiredPackages = $restart
@@ -1413,7 +1494,8 @@ function Test-RetryableInstallerExitCode {
 function Select-PolicyPackages {
   param(
     [object[]]$Packages,
-    [object[]]$DeferredPackageIds
+    [object[]]$DeferredPackageIds,
+    [object[]]$ApplicationRestartPackages
   )
 
   $script:SelectionDeferredCount = 0
@@ -1519,6 +1601,11 @@ function Select-PolicyPackages {
         } | Out-Null
         continue
       }
+      if (@($ApplicationRestartPackages | Where-Object { Test-SameRecordedTarget $_ $pkg }).Count) {
+        $script:SelectionDeferredCount++
+        Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{ packageId = $pkg.Id; status = 'DeferredApplicationRestartPendingVerification'; available = $pkg.Available; source = $pkg.Source } | Out-Null
+        continue
+      }
 
       $pkg
     }
@@ -1526,17 +1613,18 @@ function Select-PolicyPackages {
 }
 
 function Get-AssessmentSummaryFields {
-  param([int]$DiscoveredCount, [int]$SelectedCount, [hashtable]$Summary, [int]$CarriedRestartCount)
+  param([int]$DiscoveredCount, [int]$SelectedCount, [hashtable]$Summary, [int]$CarriedRestartCount, [int]$PostRebootReviewCount, [int]$ApplicationRestartPendingCount)
   $pending = $CarriedRestartCount + $Summary.RestartRequired
   $fields = @{
     assessmentCompleted = $true
     assessmentOutcome = $(if ($DiscoveredCount -eq 0) { 'NoUpdatesOffered' } elseif ($SelectedCount -eq 0) { 'NoEligibleUpdates' } else { 'UpdatesProcessed' })
-    coverageStatus = $(if ($SelectedCount -lt $DiscoveredCount -or $Summary.Failed -gt 0 -or $Summary.Deferred -gt 0 -or $pending -gt 0) { 'UnresolvedOffers' } else { 'NoUnresolvedOffers' })
+    coverageStatus = $(if ($SelectedCount -lt $DiscoveredCount -or $Summary.Failed -gt 0 -or $Summary.Deferred -gt 0 -or $pending -gt 0 -or $ApplicationRestartPendingCount -gt 0) { 'UnresolvedOffers' } else { 'NoUnresolvedOffers' })
     discoveredCount = $DiscoveredCount; selectedCount = $SelectedCount; deferredCount = $Summary.Deferred
     succeededCount = $Summary.Succeeded; failedCount = $Summary.Failed
     applicabilityDeferredCount = $script:ApplicabilityDeferredCount
-    restartRequired = ($pending -gt 0); pendingRestartCount = $pending
+    restartRequired = ($pending -gt $PostRebootReviewCount); pendingRestartCount = $pending
     newRestartCount = $Summary.RestartRequired; carriedRestartCount = $CarriedRestartCount
+    postRebootReviewCount = $PostRebootReviewCount; applicationRestartPendingCount = $ApplicationRestartPendingCount
   }
   foreach ($key in $script:SelectionCounts.Keys) { $fields[$key] = $script:SelectionCounts[$key] }
   return $fields
@@ -1633,6 +1721,7 @@ function Get-WingetCommandOutcome {
     HResult = $hresult
     DownloadUrl = $url
     InstallerStarted = $installerStarted
+    ApplicationRestartRequested = ($status -eq 'Succeeded' -and $output -match '(?im)\bRestart the application to complete the upgrade\.\s*$')
     Diagnostic = $output.Trim()
   }
 }
@@ -2055,6 +2144,15 @@ function Invoke-PackageUpgrade {
       return 'RestartRequired'
     }
 
+    if ($Mode -eq 'User' -and $wingetExitCode -eq 0 -and $commandOutcome.ApplicationRestartRequested) {
+      Add-PendingApplicationRestart -Package $Package -EvidencePath $evidencePath
+      Write-AgentEvent -EventId 5300 -EntryType Information -Fields @{
+        packageId = $Package.Id; status = 'ApplicationRestartPendingVerification'; wingetExitCode = $wingetExitCode
+        available = $Package.Available; source = $Package.Source; evidencePath = $evidencePath; logPath = $packageLogPath
+      } | Out-Null
+      return 'ApplicationRestartPending'
+    }
+
     if ($wingetExitCode -in @(0, 3010, 1641) -and ($commandOutcome.Status -eq 'Succeeded' -or $installerOutcome.FinalSuccess)) {
       $verification = Test-WingetPackageStillOffered -Package $Package
       Write-PackageAttemptEvidence -Package $Package -UpgradeResult $upgradeResult -InstallerExitCode $installerExitCode -InstallerOutcome $installerOutcome -CommandOutcome $commandOutcome -RebootBefore $rebootBefore -RebootAfter $rebootAfter -InstallerType $installerType -EvidencePath $evidencePath -Attempt $attempt -Arguments $args -Verification $verification
@@ -2194,8 +2292,11 @@ try {
   $availablePackages = @($inventory.Packages)
   Write-WingetInventorySnapshot -Packages $availablePackages
   $restartVerification = Resolve-PendingRestartVerification -AvailablePackages $availablePackages
-  Resolve-RecordedPackageState -AvailablePackages $availablePackages -ResolvedRestartIds @(@($restartVerification.ResolvedPackageIds) + @($restartVerification.FailedPackages | ForEach-Object { $_.Id }))
-  $selectedPackages = @(Select-PolicyPackages -Packages $availablePackages -DeferredPackageIds $restartVerification.DeferredPackageIds)
+  $reviewRestart = @($restartVerification.ReviewPackages)
+  $resolvedRestartIds = @(@($restartVerification.ResolvedPackageIds) + @($restartVerification.FailedPackages | ForEach-Object { $_.Id }))
+  $applicationRestart = @(Resolve-PendingApplicationRestart -AvailablePackages $availablePackages)
+  Resolve-RecordedPackageState -AvailablePackages $availablePackages -ResolvedRestartIds $resolvedRestartIds -ReviewRestartPackages $reviewRestart -ApplicationRestartPackages $applicationRestart
+  $selectedPackages = @(Select-PolicyPackages -Packages $availablePackages -DeferredPackageIds $restartVerification.DeferredPackageIds -ApplicationRestartPackages $applicationRestart)
 
   $summary = @{
     Succeeded       = 0
@@ -2211,14 +2312,7 @@ try {
     $failedPackages.Add($pendingFailure)
   }
 
-  if ($selectedPackages.Count -eq 0 -and $summary.Failed -eq 0) {
-    $fields = Get-AssessmentSummaryFields -DiscoveredCount $availablePackages.Count -SelectedCount 0 -Summary $summary -CarriedRestartCount $restartVerification.PendingRestartCount
-    $fields.status = if ($restartVerification.PendingRestartCount -gt 0) { 'CompletedRestartRequired' } else { 'NoPackagesSelected' }
-    Write-AgentEvent -EventId 5001 -EntryType Information -Fields $fields | Out-Null
-    Clear-NotificationState -PreserveRestartRequired
-    exit 0
-  }
-
+  $newApplicationRestart = $false
   foreach ($pkg in $selectedPackages) {
     $result = Invoke-PackageUpgrade -Package $pkg
     if ($summary.ContainsKey($result)) {
@@ -2228,20 +2322,29 @@ try {
       $restartRequiredPackages.Add($pkg)
     } elseif ($result -eq 'Failed') {
       $failedPackages.Add($pkg)
+    } elseif ($result -eq 'ApplicationRestartPending') {
+      $summary.Deferred++
+      $newApplicationRestart = $true
     }
   }
+  if ($newApplicationRestart) {
+    $applicationRestart = @(Get-ApplicationRestartState)
+    Resolve-RecordedPackageState -AvailablePackages $availablePackages -ResolvedRestartIds $resolvedRestartIds -ReviewRestartPackages $reviewRestart -ApplicationRestartPackages $applicationRestart
+  }
 
-  $pendingRestartCount = $summary.RestartRequired + $restartVerification.PendingRestartCount
-  $finalStatus = if ($summary.Failed -gt 0) { 'CompletedWithFailures' } elseif ($pendingRestartCount -gt 0) { 'CompletedRestartRequired' } else { 'Completed' }
-  $fields = Get-AssessmentSummaryFields -DiscoveredCount $availablePackages.Count -SelectedCount $selectedPackages.Count -Summary $summary -CarriedRestartCount $restartVerification.PendingRestartCount
+  $rebootRequired = $summary.RestartRequired + $restartVerification.PendingRestartCount -gt $reviewRestart.Count
+  $finalStatus = if ($summary.Failed -gt 0) { 'CompletedWithFailures' } elseif ($rebootRequired) { 'CompletedRestartRequired' } elseif ($reviewRestart.Count) { 'CompletedRestartVerificationInconclusive' } elseif ($selectedPackages.Count -eq 0) { 'NoPackagesSelected' } else { 'Completed' }
+  $fields = Get-AssessmentSummaryFields -DiscoveredCount $availablePackages.Count -SelectedCount $selectedPackages.Count -Summary $summary -CarriedRestartCount $restartVerification.PendingRestartCount -PostRebootReviewCount $reviewRestart.Count -ApplicationRestartPendingCount $applicationRestart.Count
   $fields.status = $finalStatus
-  $fields.packageId = '*'
-  $fields.recoveryActions = @("Succeeded=$($summary.Succeeded)", "RestartRequired=$($summary.RestartRequired)", "Failed=$($summary.Failed)", "Deferred=$($summary.Deferred)")
+  if ($selectedPackages.Count -gt 0 -or $summary.Failed -gt 0) {
+    $fields.packageId = '*'
+    $fields.recoveryActions = @("Succeeded=$($summary.Succeeded)", "RestartRequired=$($summary.RestartRequired)", "Failed=$($summary.Failed)", "Deferred=$($summary.Deferred)")
+  }
   Write-AgentEvent -EventId 5001 -EntryType Information -Fields $fields | Out-Null
-  if ($finalStatus -eq 'Completed') {
-    Clear-NotificationState -PreserveRestartRequired
-  } else {
+  if ($summary.Failed -gt 0 -or $restartRequiredPackages.Count -gt 0) {
     Write-NotificationState -Status $finalStatus -Summary $summary -RestartRequiredPackages $restartRequiredPackages.ToArray() -FailedPackages $failedPackages.ToArray()
+  } else {
+    Clear-NotificationState -PreserveRestartRequired
   }
 
   if ($summary.Failed -gt 0) { exit 1 }
@@ -2264,178 +2367,3 @@ try {
     $script:RunLock.Dispose()
   }
 }
-
-# SIG # Begin signature block
-# MIIgEQYJKoZIhvcNAQcCoIIgAjCCH/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
-# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBvi9znOy3shkJn
-# SKAk/onM24U95VRPgeWMPDN4Sf1PfKCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
-# 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
-# EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
-# BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
-# Fw0zMTExMDkyMzU5NTlaMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2Vy
-# dCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lD
-# ZXJ0IFRydXN0ZWQgUm9vdCBHNDCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoC
-# ggIBAL/mkHNo3rvkXUo8MCIwaTPswqclLskhPfKK2FnC4SmnPVirdprNrnsbhA3E
-# MB/zG6Q4FutWxpdtHauyefLKEdLkX9YFPFIPUh/GnhWlfr6fqVcWWVVyr2iTcMKy
-# unWZanMylNEQRBAu34LzB4TmdDttceItDBvuINXJIB1jKS3O7F5OyJP4IWGbNOsF
-# xl7sWxq868nPzaw0QF+xembud8hIqGZXV59UWI4MK7dPpzDZVu7Ke13jrclPXuU1
-# 5zHL2pNe3I6PgNq2kZhAkHnDeMe2scS1ahg4AxCN2NQ3pC4FfYj1gj4QkXCrVYJB
-# MtfbBHMqbpEBfCFM1LyuGwN1XXhm2ToxRJozQL8I11pJpMLmqaBn3aQnvKFPObUR
-# WBf3JFxGj2T3wWmIdph2PVldQnaHiZdpekjw4KISG2aadMreSx7nDmOu5tTvkpI6
-# nj3cAORFJYm2mkQZK37AlLTSYW3rM9nF30sEAMx9HJXDj/chsrIRt7t/8tWMcCxB
-# YKqxYxhElRp2Yn72gLD76GSmM9GJB+G9t+ZDpBi4pncB4Q+UDCEdslQpJYls5Q5S
-# UUd0viastkF13nqsX40/ybzTQRESW+UQUOsxxcpyFiIJ33xMdT9j7CFfxCBRa2+x
-# q4aLT8LWRV+dIPyhHsXAj6KxfgommfXkaS+YHS312amyHeUbAgMBAAGjggE6MIIB
-# NjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBTs1+OC0nFdZEzfLmc/57qYrhwP
-# TzAfBgNVHSMEGDAWgBRF66Kv9JLLgjEtUYunpyGd823IDzAOBgNVHQ8BAf8EBAMC
-# AYYweQYIKwYBBQUHAQEEbTBrMCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdp
-# Y2VydC5jb20wQwYIKwYBBQUHMAKGN2h0dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNv
-# bS9EaWdpQ2VydEFzc3VyZWRJRFJvb3RDQS5jcnQwRQYDVR0fBD4wPDA6oDigNoY0
-# aHR0cDovL2NybDMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0QXNzdXJlZElEUm9vdENB
-# LmNybDARBgNVHSAECjAIMAYGBFUdIAAwDQYJKoZIhvcNAQEMBQADggEBAHCgv0Nc
-# Vec4X6CjdBs9thbX979XB72arKGHLOyFXqkauyL4hxppVCLtpIh3bb0aFPQTSnov
-# Lbc47/T/gLn4offyct4kvFIDyE7QKt76LVbP+fT3rDB6mouyXtTP0UNEm0Mh65Zy
-# oUi0mcudT6cGAxN3J0TU53/oWajwvy8LpunyNDzs9wPHh6jSTEAZNUZqaVSwuKFW
-# juyk1T3osdz9HNj0d1pcVIxv76FQPfx2CWiEn2/K2yCNNWAcAgPLILCsWKAOQGPF
-# mCLBsln1VWvPJ6tsds5vIy30fnFqI2si/xK4VC0nftg62fC2h5b9W9FcrBjDTZ9z
-# twGpn1eqXijiuZQwgga0MIIEnKADAgECAhANx6xXBf8hmS5AQyIMOkmGMA0GCSqG
-# SIb3DQEBCwUAMGIxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMx
-# GTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xITAfBgNVBAMTGERpZ2lDZXJ0IFRy
-# dXN0ZWQgUm9vdCBHNDAeFw0yNTA1MDcwMDAwMDBaFw0zODAxMTQyMzU5NTlaMGkx
-# CzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UEAxM4
-# RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEyNTYg
-# MjAyNSBDQTEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQC0eDHTCphB
-# cr48RsAcrHXbo0ZodLRRF51NrY0NlLWZloMsVO1DahGPNRcybEKq+RuwOnPhof6p
-# vF4uGjwjqNjfEvUi6wuim5bap+0lgloM2zX4kftn5B1IpYzTqpyFQ/4Bt0mAxAHe
-# HYNnQxqXmRinvuNgxVBdJkf77S2uPoCj7GH8BLuxBG5AvftBdsOECS1UkxBvMgEd
-# gkFiDNYiOTx4OtiFcMSkqTtF2hfQz3zQSku2Ws3IfDReb6e3mmdglTcaarps0wjU
-# jsZvkgFkriK9tUKJm/s80FiocSk1VYLZlDwFt+cVFBURJg6zMUjZa/zbCclF83bR
-# VFLeGkuAhHiGPMvSGmhgaTzVyhYn4p0+8y9oHRaQT/aofEnS5xLrfxnGpTXiUOeS
-# LsJygoLPp66bkDX1ZlAeSpQl92QOMeRxykvq6gbylsXQskBBBnGy3tW/AMOMCZIV
-# NSaz7BX8VtYGqLt9MmeOreGPRdtBx3yGOP+rx3rKWDEJlIqLXvJWnY0v5ydPpOjL
-# 6s36czwzsucuoKs7Yk/ehb//Wx+5kMqIMRvUBDx6z1ev+7psNOdgJMoiwOrUG2Zd
-# SoQbU2rMkpLiQ6bGRinZbI4OLu9BMIFm1UUl9VnePs6BaaeEWvjJSjNm2qA+sdFU
-# eEY0qVjPKOWug/G6X5uAiynM7Bu2ayBjUwIDAQABo4IBXTCCAVkwEgYDVR0TAQH/
-# BAgwBgEB/wIBADAdBgNVHQ4EFgQU729TSunkBnx6yuKQVvYv1Ensy04wHwYDVR0j
-# BBgwFoAU7NfjgtJxXWRM3y5nP+e6mK4cD08wDgYDVR0PAQH/BAQDAgGGMBMGA1Ud
-# JQQMMAoGCCsGAQUFBwMIMHcGCCsGAQUFBwEBBGswaTAkBggrBgEFBQcwAYYYaHR0
-# cDovL29jc3AuZGlnaWNlcnQuY29tMEEGCCsGAQUFBzAChjVodHRwOi8vY2FjZXJ0
-# cy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkUm9vdEc0LmNydDBDBgNVHR8E
-# PDA6MDigNqA0hjJodHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVz
-# dGVkUm9vdEc0LmNybDAgBgNVHSAEGTAXMAgGBmeBDAEEAjALBglghkgBhv1sBwEw
-# DQYJKoZIhvcNAQELBQADggIBABfO+xaAHP4HPRF2cTC9vgvItTSmf83Qh8WIGjB/
-# T8ObXAZz8OjuhUxjaaFdleMM0lBryPTQM2qEJPe36zwbSI/mS83afsl3YTj+IQhQ
-# E7jU/kXjjytJgnn0hvrV6hqWGd3rLAUt6vJy9lMDPjTLxLgXf9r5nWMQwr8Myb9r
-# EVKChHyfpzee5kH0F8HABBgr0UdqirZ7bowe9Vj2AIMD8liyrukZ2iA/wdG2th9y
-# 1IsA0QF8dTXqvcnTmpfeQh35k5zOCPmSNq1UH410ANVko43+Cdmu4y81hjajV/gx
-# dEkMx1NKU4uHQcKfZxAvBAKqMVuqte69M9J6A47OvgRaPs+2ykgcGV00TYr2Lr3t
-# y9qIijanrUR3anzEwlvzZiiyfTPjLbnFRsjsYg39OlV8cipDoq7+qNNjqFzeGxcy
-# tL5TTLL4ZaoBdqbhOhZ3ZRDUphPvSRmMThi0vw9vODRzW6AxnJll38F0cuJG7uEB
-# YTptMSbhdhGQDpOXgpIUsWTjd6xpR6oaQf/DJbg3s6KCLPAlZ66RzIg9sC+NJpud
-# /v4+7RWsWCiKi9EOLLHfMR2ZyJ/+xhCx9yHbxtl5TPau1j/1MIDpMPx0LckTetiS
-# uEtQvLsNz3Qbp7wGWqbIiOWCnb5WqxL3/BAPvIXKUjPSxyZsq8WhbaM2tszWkPZP
-# ubdcMIIG7TCCBNWgAwIBAgIQCE/cM09+RU7bww+P+ZIYNTANBgkqhkiG9w0BAQsF
-# ADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNV
-# BAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hB
-# MjU2IDIwMjUgQ0ExMB4XDTI2MDgwNTAwMDAwMFoXDTM3MTEwNDIzNTk1OVowYzEL
-# MAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMTswOQYDVQQDEzJE
-# aWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1lc3RhbXAgUmVzcG9uZGVyIDIwMjYg
-# MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBALZ7pvLJ/s1K+NSbTGWz
-# /TjGMPh8CQ6RucZCLv5anHzWJjF/NWJrFIhy24fcpKXlgRiky4WAawDfU3YP0BMx
-# t9l3Dm5oCG5Z69AqEN1kgHg2epx+l+lZBcmJCcN0ASURML5uFIS80sZsDwO3BSkU
-# xDjLJhBI+qiZP3aixAC/qEGLjsBNlLol9VZ7pfGEXiMlneJIC5/YKuizVzNFKZZE
-# eoy/0B8Zm+nzKBgSWG52lCO1w+nCg6XpCtklTJXeIg283hw7TmmsZXR+SMbjbrEO
-# vZ3fP2VxIgeR28Y90ZStd3F9VuA5RVynb/whITPAo9b75Zr4Ta6Mj3URm26QZYMn
-# /FnbuTegcoRcFEZ9FOqM5T6MTdtr/n74lIT/ug0eeOzmZ6QTFg33otX+bFRsIolv
-# ykE1jive4PuESaT8zzVeFWDAMDtozNgLctkGD1ZjkEyZtJrLl5ya0m5doH/ScpaZ
-# CZVl6pNUOCybMc/kxC6EAmSJY24L0yYKD1Nkddsnb/ItVKi/2nXpQNMu1PT5prW8
-# 3vV8d67WowuUs0HdY4H8AMLGvdL/WHEj3ZnqMqAQQP9u3Ai9t+5eQ02GDwy0ODjd
-# zi0xlp70W+ow63/0++YDEX1M0iwgUHwbrJvfpklkZQvw3+kv3vUPItdwroczk9ic
-# flf55W1zOEKAcJVAIXpcMCU9AgMBAAGjggGVMIIBkTAMBgNVHRMBAf8EAjAAMB0G
-# A1UdDgQWBBQUyWOKMC7USvtulPPm40B+9ezN4jAfBgNVHSMEGDAWgBTvb1NK6eQG
-# fHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMCB4AwFgYDVR0lAQH/BAwwCgYIKwYB
-# BQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQGCCsGAQUFBzABhhhodHRwOi8vb2Nz
-# cC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKGUWh0dHA6Ly9jYWNlcnRzLmRpZ2lj
-# ZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRpbWVTdGFtcGluZ1JTQTQwOTZTSEEy
-# NTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSgUqBQhk5odHRwOi8vY3JsMy5kaWdp
-# Y2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRUaW1lU3RhbXBpbmdSU0E0MDk2U0hB
-# MjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAIBgZngQwBBAIwCwYJYIZIAYb9bAcB
-# MA0GCSqGSIb3DQEBCwUAA4ICAQCNxTphHp1SCt+ZrAmAfn0oQLFr0mLywSLaDXQI
-# ENoyKqxrFbJblzCVP/pkXmwXOdrOpWygLzlT12os5ipDCy35RBCg2UMeApEtrfGh
-# z45F4Wt4WGdNdIbRWt3YTYJmpR+b7lr4d7Uwn+H600u4D7RnOGf8Wj4UNgAdZkfH
-# hHv1mx9EVh71SJelcEN/oORSjXzdjfw1iZH9d8Nh/thn6hH23d+VsPAr6GAYyzSA
-# 02nXD1nYLI7Ijmiv+xLCiYC41DSFYL3GhTiy0PxpawPtGRyaBVGzq+UiTfM8pD7K
-# VyF5aQyWP4KhVGUUTnmm/RlYJoW3TiXA/+t0YcT2oRVBm3JETjajHug2AL+v5jht
-# KVnd3D0rbHXEu27o+Q8p4sEWPMqKDB+qbceb6T/6WcwTwXmQ9lOCLLYcsQeSWmvK
-# qzpAec9etE14jOQAzLKWdE3w/TCaKtLRaRT7LCkRYVnhA2D73FLje1O5b3HR5eHs
-# 0NzU/+xX7NbEdcofy0W3Wdwd1XOqtlpg/JgwtKfZM5dqO94lbUveOiJBI+xZEbGR
-# sMNbXmMREUTgu+Oca7Y73MPWcslIx2VhkSKSXjDbD6rgg39H5Mh7QfieAIjWagkJ
-# Nt68Yfim6cjEzVSiLSeZfdkr5dtFPTW6jATlWJdYeeDRGCyatf8R1hSjzSvdN8yW
-# QPT9gzCCBu4wggXWoAMCAQICE1YAAAD7uI/G5fXiwIQAAQAAAPswDQYJKoZIhvcN
-# AQELBQAwSDEVMBMGCgmSJomT8ixkARkWBWxvY2FsMRcwFQYKCZImiZPyLGQBGRYH
-# bmV4cG9ydDEWMBQGA1UEAxMNbmV4cG9ydC1sb2NhbDAeFw0yNjA3MDYxNjEzMjla
-# Fw0yNzA3MDYxNjEzMjlaMHQxFTATBgoJkiaJk/IsZAEZFgVsb2NhbDEXMBUGCgmS
-# JomT8ixkARkWB25leHBvcnQxEjAQBgNVBAsTCURpdmlzaW9uczEaMBgGA1UECxMR
-# TmV4cG9ydCBTb2x1dGlvbnMxEjAQBgNVBAMTCURhbiBQdXBlazCCASIwDQYJKoZI
-# hvcNAQEBBQADggEPADCCAQoCggEBAMZQ4zJZc+eugIuUhFyk+eVYC9gkueExn2Sx
-# JvuJ+K9v9ykS2jTErJWxVzACQokpRuu7X7t7ZTkMIjQvl7ovzxDsRHOZ93gvBR61
-# D7rwHUll1lMqOUzoA/5pHRMmlrxzLk0TK5I7XW0aCU94RHfktU0DIb0MpiGUyKcO
-# 5LCVer4D0lXzqTTIDiizY+lJPRYKNfxnK3tGdROO/NObmWeFOlKnDlNxmCBsSMv8
-# e6gBs7pk70TTUAf6yq3sCQ45Oo+q58Z0dMw5+5pir2K3pY/En/BWsULa5Qn9Xy66
-# lcr19YpqVjq83NoOtgmaw4hGz8zjGdZLOj9YA3bKQNxDDZqcCqkCAwEAAaOCA6Mw
-# ggOfMD4GCSsGAQQBgjcVBwQxMC8GJysGAQQBgjcVCIWJh2SF+5lKhLmbLYXr+FeH
-# /JYDgRWE9e0NhtrrNgIBZAIBADATBgNVHSUEDDAKBggrBgEFBQcDAzAOBgNVHQ8B
-# Af8EBAMCB4AwGwYJKwYBBAGCNxUKBA4wDDAKBggrBgEFBQcDAzAdBgNVHQ4EFgQU
-# egRE7DA1bfxWX5Xw8IpDWAn/P3wwHwYDVR0jBBgwFoAUp/6qLWthmwXFyv6qX9Gn
-# /xl4WqQwgc0GA1UdHwSBxTCBwjCBv6CBvKCBuYaBtmxkYXA6Ly8vQ049bmV4cG9y
-# dC1sb2NhbCxDTj1PS0NEQzAyLENOPUNEUCxDTj1QdWJsaWMlMjBLZXklMjBTZXJ2
-# aWNlcyxDTj1TZXJ2aWNlcyxDTj1Db25maWd1cmF0aW9uLERDPW5leHBvcnQsREM9
-# bG9jYWw/Y2VydGlmaWNhdGVSZXZvY2F0aW9uTGlzdD9iYXNlP29iamVjdENsYXNz
-# PWNSTERpc3RyaWJ1dGlvblBvaW50MIIBhQYIKwYBBQUHAQEEggF3MIIBczCBrgYI
-# KwYBBQUHMAKGgaFsZGFwOi8vL0NOPW5leHBvcnQtbG9jYWwsQ049QUlBLENOPVB1
-# YmxpYyUyMEtleSUyMFNlcnZpY2VzLENOPVNlcnZpY2VzLENOPUNvbmZpZ3VyYXRp
-# b24sREM9bmV4cG9ydCxEQz1sb2NhbD9jQUNlcnRpZmljYXRlP2Jhc2U/b2JqZWN0
-# Q2xhc3M9Y2VydGlmaWNhdGlvbkF1dGhvcml0eTBeBggrBgEFBQcwAYZSaHR0cDov
-# L09LQ0RDMDIubmV4cG9ydC5sb2NhbC9DZXJ0RW5yb2xsL09LQ0RDMDIubmV4cG9y
-# dC5sb2NhbF9uZXhwb3J0LWxvY2FsKDEpLmNydDBgBggrBgEFBQcwAoZUZmlsZTov
-# Ly8vT0tDREMwMi5uZXhwb3J0LmxvY2FsL0NlcnRFbnJvbGwvT0tDREMwMi5uZXhw
-# b3J0LmxvY2FsX25leHBvcnQtbG9jYWwoMSkuY3J0MDIGA1UdEQQrMCmgJwYKKwYB
-# BAGCNxQCA6AZDBdkYW4ucHVwZWtAbmV4cG9ydC5sb2NhbDBOBgkrBgEEAYI3GQIE
-# QTA/oD0GCisGAQQBgjcZAgGgLwQtUy0xLTUtMjEtMTI1NDMxNjM0MC0yODY0MzMx
-# OTY4LTQ3NzkwNTQ0MS0xMTA1MA0GCSqGSIb3DQEBCwUAA4IBAQCbq973SpW2d0oM
-# JAyWvJiZWDyuPCmzSubthWPRxVhbi6vdh40+rt3fZ6uTJ2Z8MdGLqtmNPK1HXBuj
-# 0X0/2m/5MUzyYmZjfqeRyBuSzXAdfWuZ27J5jhOOj51+KDAPEOxjRea6MZBr1ezC
-# K7asWYX1mcK19E2ZlnZTic0fx2cCVJNRTTNaQmYvxnJq0XNbbbaZcOSIW8TTERsb
-# p+NCKwm0mzfrIvA3QaX0DrpYTdNLgwm0u7kD7d/f9S/aGbXZp6L/VUqNPWc9Ld0x
-# OAu8qXJ/zFjIbs4MeClYeLsWTn0f6h3+J++egix4lZZTBfmn4tcPJL2QT7WzVKPG
-# +lmwH+uqMYIFOzCCBTcCAQEwXzBIMRUwEwYKCZImiZPyLGQBGRYFbG9jYWwxFzAV
-# BgoJkiaJk/IsZAEZFgduZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsAhNW
-# AAAA+7iPxuX14sCEAAEAAAD7MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcC
-# AQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYB
-# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIG/F6KQP2YC+
-# EXvdD13kMxRf42wkeKvqYpBY8myOStVbMA0GCSqGSIb3DQEBAQUABIIBAEqCVtcC
-# C/GyxsqDD9tmERKW8I3avXEK8S7f6NGecTg+rak+kpAtjgnjleLJZLgZdndRiVIo
-# nGhhp+3hs3kKzyGTNNlrZfiE4MOUDRHYj3kXHkem4lmorK11hcNa8uLk8StMl2Vx
-# KFXCrhhW4i1RAyCdLLYHpzwyrQBJ0NNtfJWvwGSKLFqYb1Ws+ctlBx9YrAtVqtdv
-# yus3tAaXCeuDJSVdfHBJ4Jv956JS6yTOLoKDViQzqgo5qHMSkBHIFUliDDFznSuL
-# asfUBBkODH15sbB/PE0PRyddM3GQNc2T6hf0sbYe75n7fTTzzEqVeKLwcQ6Z9D5V
-# N5zsl8+4ep7mjQ+hggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
-# CQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERp
-# Z2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIw
-# MjUgQ0ExAhAIT9wzT35FTtvDD4/5khg1MA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZI
-# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYxMTA0MjMyOTM5
-# WjAvBgkqhkiG9w0BCQQxIgQgGj3/T9xyICs2utyhyzY8zR+2Uc9ZAGe6kRehfSH3
-# jF0wDQYJKoZIhvcNAQEBBQAEggIANKjSIi0OUrsBGKkocCDxlTBFde5ZzCyEBkLK
-# aez9XfiG6vJeOrqEQDEEGsaJryHomrdi4hOmssy2UaG18KTLxTO3fwvL+8sqXRf+
-# OQhl1LYtQzLflTZ39vrE2s20VGBiXLssYXru/Je44p3aHhCaAWX2YI2VKacVPbz5
-# bWFeRjSRXrBLmRZe1Ve5Q3iAd1wr8z4O1yPIhIAtJeGmb60SwFlgDK6zYrJ8jB1K
-# ENTwsgT88R1dwYiepDHDpffCcqI/LSH+p3gJym3kKbnGTex1+i3ebV1iwUQfMiSi
-# MUf73gPm5Q/+k/KTLtNRxxcesYjrA0nnzhJ6pfYirYlw2Vrq3Mo+KZSHfJJP+Gke
-# iOReo6D+cPZ2WD9BKEGO0ebTEYXcOvrQigFW0eHww2NaBBqGXYJ4nx1XibYCWdIV
-# uNUxn3TOTW4SHB6V1SH+sw/TW6vRdJXswXESFvniftgjss5fQjV4fmhbQhV/1cW4
-# PHM/9puuS5MOEWg7XJMFeTgZ620mKjkoZJ/ipxLPh6m2HXxVJ9VED/fWofKadeJb
-# WnETFpmUmolH/xipXJ7Ek7eFNzwkV8cZiT4YSZuNmOcp2V8S2NuJ80yjlUb4LZ2U
-# 5LfWp6LkLVHCHQmrjE1ySLLvglOBGUyffd3ATHkuM2OTjopfhaHroqPvrQVFFaat
-# z2RI0z0=
-# SIG # End signature block
