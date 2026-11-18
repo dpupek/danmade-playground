@@ -18,7 +18,7 @@ $agentPath = Join-Path $runRoot 'test-agent.ps1'
 $sourceText = Get-Content -LiteralPath $originalAgentPath -Raw
 $sourceText = ($sourceText -split '# SIG # Begin signature block', 2)[0]
 $hostSeams = @'
-function Resolve-PackageInstallScope { param($Package) return $Mode }
+function Resolve-PackageInstallScope { param($Package) if ($env:FAKE_WINGET_SCENARIO -eq 'UnknownScope') { return 'Unknown' }; return $Mode }
 function Test-IsSystemAccount { return $true }
 function Initialize-EventSource { }
 function Wait-DownloadRetry { param($Attempt) return $true }
@@ -489,6 +489,29 @@ Assert-True (@($lts.Events | Where-Object status -eq 'DeferredManualOnly').Count
 Assert-True (@($lts.Calls | Where-Object { $_.Args -contains '--log' }).Count -eq 0) 'Node LTS must never invoke an installer.'
 $native = Invoke-AgentScenario -Name 'edge-native-updater' -Mode User -Scenario Success -PackageId 'Microsoft.Edge' -PackageName 'Edge' -PackageRules @([pscustomobject]@{id='Microsoft.Edge';mode='NativeUpdater'})
 Assert-True (@($native.Events | Where-Object status -eq 'DeferredNativeUpdater').Count -eq 1) 'Native updater must remain visible in compliance evidence.'
+
+# Arrange: Teams build numbering crosses a major boundary, but delegation must win.
+$sampleRules = @((Get-Content (Join-Path $repoRoot 'windows-update-scripts\danmade-patch-agent.policy.sample.json') -Raw | ConvertFrom-Json).packageRules)
+Assert-True (@($sampleRules | Where-Object { $_.id -eq 'Microsoft.Teams' -and $_.mode -eq 'NativeUpdater' }).Count -eq 1) 'Teams sample rule is missing.'
+# Act.
+$teams = Invoke-AgentScenario -Name 'teams-native-updater' -Mode User -Scenario Success -PackageId 'Microsoft.Teams' -PackageName 'Microsoft Teams' -PackageRules $sampleRules -InstalledVersion '26134.1702.4747.7366' -AvailableVersion '26149.1205.4798.6437'
+# Assert.
+Assert-True (@($teams.Calls | Where-Object { $_.Args -contains '--id' }).Count -eq 0) 'Teams native delegation must not launch an installer.'
+Assert-True (@($teams.Events | Where-Object { $_.status -eq 'DeferredNativeUpdater' -and $_.requiresAdminRemediation }).Count -eq 1) 'Teams delegation must remain an unresolved administrator obligation.'
+Assert-True (@($teams.Events | Where-Object { $_.status -eq 'NoPackagesSelected' -and $_.assessmentOutcome -eq 'NoEligibleUpdates' -and $_.coverageStatus -eq 'UnresolvedOffers' -and $_.nativeUpdaterCount -eq 1 }).Count -eq 1) 'Teams terminal summary must not claim no updates or compliance.'
+
+# Arrange: inventory offers an upgrade whose user scope cannot be proven.
+Assert-True (Test-Path $agentPath) 'Scratch agent must exist before unknown-scope execution.'
+# Act.
+$unknown = Invoke-AgentScenario -Name 'user-unknown-scope' -Mode User -Scenario UnknownScope -PackageId 'Test.Unknown' -PackageName 'Unknown App'
+# Assert.
+Assert-True (@($unknown.Calls | Where-Object { $_.Args -contains '--id' }).Count -eq 0) 'Unknown scope must not launch an installer.'
+Assert-True (@($unknown.Events | Where-Object { $_.status -eq 'NoPackagesSelected' -and $_.assessmentCompleted -and $_.scopeUnknownCount -eq 1 -and $_.assessmentOutcome -eq 'NoEligibleUpdates' -and $_.coverageStatus -eq 'UnresolvedOffers' }).Count -eq 1) 'Unknown scope must be visible in the completed assessment.'
+Assert-True (@($userSuccess.Events | Where-Object { $_.status -eq 'Completed' -and $_.assessmentOutcome -eq 'UpdatesProcessed' -and $_.succeededCount -eq 1 -and $_.coverageStatus -eq 'NoUnresolvedOffers' }).Count -eq 1) 'Successful verification summary is incorrect.'
+Assert-True (@($noApplicable.Events | Where-Object { $_.status -eq 'Completed' -and $_.applicabilityDeferredCount -eq 1 -and $_.coverageStatus -eq 'UnresolvedOffers' }).Count -eq 1) 'Applicability deferral must not look compliant.'
+$cachedTerminals = @($noApplicableCached.Events | Where-Object { $_.status -eq 'Completed' })
+Assert-True ($cachedTerminals.Count -eq 2) 'The reused log must contain the original and cached assessments.'
+Assert-True ($cachedTerminals[-1].applicabilityDeferredCount -eq 1 -and $cachedTerminals[-1].coverageStatus -eq 'UnresolvedOffers') 'The latest cached applicability assessment must retain its own deferral count.'
 Assert-True (@($native.Calls | Where-Object { $_.Args -contains '--log' }).Count -eq 0) 'Native updater must not invoke winget installer.'
 foreach ($fixture in @(@{Scenario='ReleaseHold';Status='DeferredKnownBadRelease';Attempts=0},@{Scenario='ReleaseHoldUnreadable';Status='DeferredReleaseHoldUnverified';Attempts=0},@{Scenario='ReleaseHoldCorrected';Status='Succeeded';Attempts=1})) {
   $rule = [pscustomobject]@{id='Test.Held';mode='Auto';releaseHolds=@([pscustomobject]@{version='1.1.0';scope='user';installerSha256=('a'*64);until=(Get-Date).AddDays(7).ToString('o');reason='Bad fixture'})}
@@ -545,5 +568,5 @@ try {
   Status = 'Passed'
   RunRoot = $runRoot
   MachineScenario = if ($machineSuccess.Skipped) { $machineSuccess.SkipReason } else { 'Passed' }
-  Scenarios = @($machineSuccess.Name, $userSuccess.Name, $stillOffered.Name, $installer1605.Name, $installer1603.Name, $continuedInstallerSuccess.Name, $downloadFailure.Name, $noApplicable.Name, $noInstaller.Name, $manualOnly.Name, $majorVersion.Name, $quiescence.Name, 'health-stale-process', 'health-orphan-and-launch-failure', 'edge-technology-mismatch','copilot-no-upgrade','chrome-download-timeout','msi-later-failure','msi-restart','inventory-failure','verification-malformed','installed-package-not-found','native-restart','burn-restart','node-lts-manual-only','edge-native-updater','ReleaseHold','ReleaseHoldUnreadable','ReleaseHoldCorrected')
+  Scenarios = @($machineSuccess.Name, $userSuccess.Name, $stillOffered.Name, $installer1605.Name, $installer1603.Name, $continuedInstallerSuccess.Name, $downloadFailure.Name, $noApplicable.Name, $noInstaller.Name, $manualOnly.Name, $majorVersion.Name, $quiescence.Name, 'health-stale-process', 'health-orphan-and-launch-failure', 'edge-technology-mismatch','copilot-no-upgrade','chrome-download-timeout','msi-later-failure','msi-restart','inventory-failure','verification-malformed','installed-package-not-found','native-restart','burn-restart','node-lts-manual-only','edge-native-updater','teams-native-updater','user-unknown-scope','ReleaseHold','ReleaseHoldUnreadable','ReleaseHoldCorrected')
 } | ConvertTo-Json -Depth 5

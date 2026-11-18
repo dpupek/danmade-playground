@@ -1,6 +1,6 @@
 # Patch Agent Reliability Hardening
 
-Date: 2026-11-03
+Date: 2026-11-06
 
 Operator Level: Windows-first beginner operator (little Windows domain experience and no Linux experience)
 
@@ -18,6 +18,179 @@ and unavailable policy falls back to broad defaults.
 
 ## Iterations
 
+### November 6 Read-Only Acceptance Review
+
+- [x] Collect eight of 17 pilot members at 11:17 Central: seven use the November 4 main-package release; all eight cached signatures are Valid. Both DC agent/policy hashes still match publication. Bounded logs show no parse errors, active-run records, matching live agent processes or recent LocalBootstrapFailure events.
+- [x] Observe real VerifiedNotOffered acceptance for DEVWKS03 WinDbg and NEX-LAPTOP-02 Terminal. NEX-LAPTOP-05 completed its 02:07 Eastern Machine assessment with three verified successes; its earlier Health overdue warning predates this run. This is sampled acceptance, not full pilot completion.
+- [ ] First implement separate application-restart pending handling: Terminal on DEVWKS01/03 and ChatGPT on NEX-LAPTOP-01 return success plus "Restart the application to complete the upgrade", then VerificationFailedStillOffered. Preserve strict Main target proof; persist bounded per-user/package/source/target state, request close/reopen and suppress repeated reinstall attempts. Do not turn application restart into OS reboot or assume installation is current. Add deterministic AAAA cases for app-restart output, target convergence, unchanged target, timeout and ordinary installer failure.
+- [ ] Diagnose NEX-LAPTOP-03 refresh launch before its seven-day cache gate expires around November 11 at 04:44 Central. Latest refresh 10:28 returns 0xFFFD0000; cache is still prior 33BE7036CE8BCD89FB0A09EB604E1CFA4A498388BE0C4398E97E3DA264AC424C, last verified November 4. Capture exact SYSTEM startup stderr/file-open evidence; current administrative UNC reads cannot establish root cause. Extend report-only Health to include Refresh Local Cache failures and aging successful verification before expiry; it currently ignores that task and reports zero findings here.
+- [ ] Correct conservative target proof for Zoom.Zoom.EXE 7.2.5 (51704): System.Version.TryParse rejects the raw target before installed-registration comparison. NEX-LAPTOP-02 has rebooted but retains RestartVerificationInconclusive/admin-remediation evidence. Use product-aware version/build tests and same-scope proof; retain raw values and distinguish post-reboot review from another reboot request. Actual target installation remains unverified. Reconcile older .NET notices only against a real Machine assessment or authoritative installed proof.
+- [ ] Diagnose overnight availability on laptops 02/06 without widening the 02:00-04:00 local Machine window. Latest runs skip outside that window; last real assessments are November 1/5 respectively. One recovered laptop 05 night does not establish a permanent fix. Coordinate pending OS restarts on DEVWKS03/05 and laptop 05; keep Azd/Rustup applicability and native-updater/Unknown-scope coverage separate.
+- [ ] Recover visibility for nine members: DNS unresolved for SCM-LAPTOP2/laptop 04 and WinRM collection failed for seven others. Do not expand rollout from an eight-member sample.
+
+Detailed evidence and ordered recommendations are in the SysOps pilot runbook's
+November 6 section. Local receipts are under
+E:\Sandbox\SysOps-And-CyberSecurity\.scratch\patch-agent-review-20261106-171712,
+including analysis-summary.json and classifier-readback.json. Pure production
+function replay confirms the application-restart gap and unparseable Zoom target;
+no agent entry point or installer ran. The 174-check release receipt remains
+historical; this documentation-only review makes no new code/test/deployment claim.
+No endpoint state, policy, GPO, membership, signed code, task or network changes,
+commit or push occurred. Repo docs and Quick Memory apply; no exact execution
+case or Vanta target was identified, DNS-only case 255215 remains unchanged, and
+marketplace synchronization is inapplicable because no skill/plugin changed.
+
+### November 4 Authorized Main-Package Release
+
+- [x] Recheck tested unsigned source SHA256 0F96618A97EB6B71328E06C72A1525761612C7647EF40E2CDAC745ED0859BFD6, 174-check validation receipt, approved signer/private key and both DC baselines.
+- [x] Sign/timestamp the agent with SHA256, approved signer DB13837BA676E68359DC408F476C7DD1F57AFF41 and DigiCert timestamp; independently verify Valid and zero parser errors. Exact staged release passed Windows PowerShell 5.1 AllSigned cache-installer WhatIf without changing local cache.
+- [x] At 17:30 Central back up all seven existing payload files, publish only the agent with atomic replacement, and verify both replicas. All five PS1 signatures are Valid/timestamped; policy, other payload hashes, ACLs, GPT.INI/ScheduledTasks XML and GPO AD revision 22/0 are unchanged. Pilot membership remains 17.
+- [x] Record release/rollback receipts and update handoff/Quick Memory. No task start, cache refresh, package installation, GPO change, restart, commit or push occurred.
+- [ ] Observe natural endpoint cache convergence and a real User assessment proving main-package scope/version behavior. Laptop 03's intermittent refresh-launch failure remains a separate open diagnostic; publication does not fix or prove that path.
+
+This supersedes the local unsigned checkpoint below. Published agent SHA256 is
+2FCCB1A6E7E5DDB1F673E4F0CA23C7374A11D6B67D0A1794FF9839978B476EB0.
+Live policy remains 27C20CBF5C0ECD03B9180457BFA08B6C8BE24A9BCBA331FF1CCEF0CF44F150FD.
+Publication manifest and verified rollback backup are source-local under
+`.scratch\publication-20261104-173035-e95598b6`; manifest status is
+PublishedAndVerifiedOnBothDCs. Candidate, baseline/post-replica hashes/ACLs,
+scope-before/after and release-validation.json are in
+`.scratch\appx-main-release-20261104`. These ignored receipts are not committed.
+
+Rollback needs owner approval: verify current agent identity, stage and atomically
+restore only the prior agent from that backup (SHA256
+33BE7036CE8BCD89FB0A09EB604E1CFA4A498388BE0C4398E97E3DA264AC424C),
+then verify both DCs and coordinate cache convergence. Stop if backup/current
+hashes or signatures differ. Policy, other payloads and endpoint state need no
+rollback for this agent-only publication. No exact execution case or Vanta target
+applies; repo docs and Quick Memory are the tracking surfaces. No reusable
+skill/plugin changed, so marketplace synchronization is not applicable.
+
+### November 4 Main-Package Fix And Refresh Diagnosis
+
+Baseline: the November 3 release queries Main and Bundle, then treats two healthy
+records of the same family as ambiguous. Terminal's bundle version differs from
+the installed main version. Cache refresh launches fail before a successful cache
+receipt on DEVWKS03; laptop 03 also has intermittent 0xFFFD0000 exits.
+
+- [x] Restrict installed identity/version evidence to healthy main packages; exclude bundle-only and unknown package-type records and preserve true multiple-main ambiguity. Query Main only, keep current-user-only scope and exclude IsBundle=true or missing IsBundle metadata.
+- [x] Add eight AAAA regressions for real-shaped bundle/main pairs, distinct versions, bundle-only/failed main and target proof. All seven Windows PowerShell 5.1 suites pass: 38 function, 29 reliability, 31 fake-winget/Health, nine cache dispatch, six ACL, 13 pilot and 48 coverage scenarios, 174 total. Parser and whitespace checks pass; coverage was rerun after the final argument-guard assertion.
+- [x] Diagnose domain-alias/DC referral and exact UNC launch/signature evidence without starting cache/patch tasks or changing trust, GPO, DFS or endpoint state. DEVWKS03 now has the November 3 cache: installed 10:12, verified 11:44 Central; successful SYSTEM task events at 10:12/11:42/11:44 predate this diagnosis. Current domain alias/direct DC reads agree and are Valid; native read-only DFS cache API selects OKCDC03, unchanged before/after. AllSigned WhatIf succeeds via all three paths in a Windows PowerShell-compatible child environment. No DFS flush or repair was performed.
+- [x] Review the minimal semantic change against the signed publication, update the admin guide and record findings/limitations. Local current-user function-only read selects exactly one healthy Terminal main at 1.24.12741.0, returns User scope and rejects target 1.25.2900.0. No installer/agent entry point ran.
+- [x] Sign/timestamp and publish the correction after authorization at 17:30 Central, as recorded in the release checkpoint above. 0F96618A97EB6B71328E06C72A1525761612C7647EF40E2CDAC745ED0859BFD6 identifies the historical tested unsigned source; current signed publication is 2FCCB1A6E7E5DDB1F673E4F0CA23C7374A11D6B67D0A1794FF9839978B476EB0. Policy remains unchanged; real User acceptance is pending. No commit/push occurred.
+- [ ] Capture exact SYSTEM launch stderr/file access on laptop 03 before changing refresh design. Its latest 12:33 refresh still returns 0xFFFD0000 while cache remains current and Valid, last verified 04:44. The sampled failing interval has no matching PowerShell engine-start event; consistent with a pre-entry UNC/File launch failure, not a proven installer or certificate defect. Remote-admin UNC failures are limited by SMB double-hop and cannot prove SYSTEM failure. Existing machine-account SYSVOL sessions likewise do not prove exact script access at failure time.
+
+Regression transcript: source-local `.scratch\appx-main-fix-20261104-123155\regressions.txt`.
+Diagnosis receipts: SysOps `.scratch\cache-launch-diagnosis-20261104-183311` and
+`cache-launch-diagnosis-20261104-183549`. The first probe's security-module error
+was a diagnostic artifact from a raw PowerShell 7 ProcessStartInfo module path;
+repeating with the registered Windows PowerShell module path only in the owned
+child yielded three exit-zero AllSigned WhatIf reads. No persistent environment
+or execution-policy change occurred; do not call that artifact the task's root cause.
+Laptop 03's existing SYSTEM network report shows healthy DC locator/secure channel,
+but its DC-name list was passed as one comma-joined string; that report's resulting
+invalid-name DNS row is not a DC outage. Its SMB multichannel warnings explicitly
+say extra-channel failures need not be application failures. Original cause of
+DEVWKS03 recovery and laptop 03's exact startup failure remain unproven.
+
+### November 4 Read-Only Outcome Check
+
+- [x] Review seven of 17 pilot members and verify both DC published hashes/agent signature. Six endpoint caches are current; DEVWKS03 remains on the old release. Six overnight Machine assessments yield eight VerifiedNotOffered-backed successes and no new package failures in the bounded sample.
+- [x] Confirm Teams/native-updater dispositions and new assessment/coverage fields on live runs. Laptop 06 completed overnight after its earlier Health overdue warning. Laptop 05 remains overdue after a daytime skip; no new reboot verifies the retained DEVWKS03/05 targets.
+- [ ] Fix Main+Bundle AppX handling with real-shaped fixtures: laptop 01 production function-only readback returns two healthy pinned Terminal registrations and Unknown scope. Bundle version 3001.24.12741.0 differs from main 1.24.12741.0; never pick the largest bundle/main version as installed-target proof. Preserve genuine ambiguity and User-only guards. No code/signature/policy change is authorized by this log review.
+- [ ] Diagnose cache refresh launch failure: DEVWKS03 scheduler event 201 proves repeated 0xFFFD0000, including the daily 01:30 run; current cached package/Health execution still works. Laptop 03's latest refresh also failed but previous refreshes succeeded and its cache is current. Do not infer a missing task from the filtered local token.
+- [ ] Diagnose laptop 05 overnight availability and unmatched ChatGPT identity; named-user AppX query finds no pinned ChatGPT family and matching ARP query is empty. Preserve Unknown until authoritative identity proof; it is not confirmed to be the bundle issue.
+- [ ] Complete approved restart coordination, Azd/Rustup applicability diagnostics and ten-member reachability. No task, install, cache refresh, reboot, GPO or source edit was performed during this investigation.
+
+Detailed findings/receipts are in the SysOps pilot runbook's November 4 section and
+local `.scratch\patch-agent-review-20261104-131703` under that workspace.
+Earlier six-suite/local implementation/publication checkpoints below are historical;
+the November 3 signatures and live release remain unchanged. This review does not
+complete pilot acceptance, signing/deployment of a bundle fix or source-control sync.
+
+### November 3 Authorized Signing And Publication
+
+- [x] Verify tested source hashes, approved signer/private key, both DC release baselines and current 17-member pilot scope.
+- [x] Sign and timestamp the changed agent; independently verify Valid signer and parse final bytes. Use SHA256, DigiCert timestamping and the existing approved CurrentUser certificate with private key, thumbprint DB13837BA676E68359DC408F476C7DD1F57AFF41 (expires July 6, 2027). No PFX/key export or import was needed.
+- [x] Back up all seven live release files with verified hashes; merge only Teams, Teams Free, Terminal, WinDbg and ChatGPT sample rules into the existing policy. Preserve all prior rules/holds and every other top-level field, including includeUnknown=true, maxRetries=1, seven blocks and Machine-only 02:00-04:00 window.
+- [x] At 16:10 Central publish only agent/policy with atomic per-file replacement, hash/signature and ACL checks; independently verify all seven release hashes and five Valid timestamped PS1 signatures on both DCs. GPO AD versions remain 22/0 and GPT.INI/ScheduledTasks XML hashes are unchanged.
+- [x] Record publication receipts and rollback, distinguish published from endpoint-cache convergence, and update handoff/Quick Memory. No refresh, patch, health, notification or restart task was forced; no GPO write, commit or push occurred.
+- [ ] Observe natural cache refresh and real next-window/user/reboot outcomes. Publication is verified, but endpoint activation and full pilot acceptance are not yet verified.
+
+This supersedes the unsigned/unpublished local checkpoint below. Published agent
+SHA256: 33BE7036CE8BCD89FB0A09EB604E1CFA4A498388BE0C4398E97E3DA264AC424C.
+Published policy SHA256: 27C20CBF5C0ECD03B9180457BFA08B6C8BE24A9BCBA331FF1CCEF0CF44F150FD.
+Other release files are unchanged. Evidence/backup/staged release are local-only in
+`.scratch\publication-20261103-outcome-coverage`; manifest.json records before/after
+hashes, original ACLs, promoted files and publication time; replica-readback.json and
+scope-readback.json record independent DC and group/GPO checks. The signed cache
+installer passed Windows PowerShell 5.1 AllSigned WhatIf against the exact candidate
+release before publication without modifying local cache. DEVWKS03's earlier cache
+pointer still names the prior release; no new endpoint effectiveness is claimed.
+
+Rollback requires owner approval: retain the backup, restore only the two changed
+files through verified staging/atomic replacement, using baseline agent
+14687A9AABA0F424FB8C00C407D41ACB909AEB8C3B314A51529E17AF98228D9C and policy
+5D6FA4DF387B10296B1D9A7E6DFDFF273BFC9CCCBCFB35E3492EC5813B2B8FE1,
+then verify signatures/hashes on both DCs and coordinate cache convergence. Stop
+if live bytes differ from this release or backup hashes/signatures do not match.
+Do not delete pending notification/restart state or broaden execution trust.
+
+### November 3 Verification And Coverage Implementation
+
+Baseline: post-reboot verification accepts an absent upgrade offer without installed
+registration proof. Scope discovery picks the first best display-name registry
+match and does not query current-user AppX registration. Teams build changes are
+held by the generic major guard. Terminal summaries lack distinct policy/scope
+disposition counts, making NoPackagesSelected easy to misread as full currency.
+
+- [x] Require positive installed-target evidence after a later boot; retain inconclusive pending state and existing genuine-failure behavior. Immediate post-install verification is unchanged.
+- [x] Add exact policy-pinned current-user AppX family matching and reject ambiguous registry matches without weakening scope guards. Sample mappings cover Terminal, WinDbg and ChatGPT; Keeper remains unconfigured pending authoritative identity.
+- [x] Add explicit Teams/Teams Free NativeUpdater sample-policy rules; preserve other products' major-version restrictions. Native-updater delegation remains unresolved administrator-owned evidence, not compliance success.
+- [x] Add additive assessment outcome and coverage counts while retaining terminal statuses and separating completed inventory from package currency.
+- [x] Add AAAA deterministic regressions and fake-winget integration cases; all seven Windows PowerShell 5.1 suites pass: 38 function, 29 reliability, 31 fake-winget/Health, nine cache dispatch, six ACL, 13 pilot and 40 coverage scenarios (166 total). Parser and sample-policy JSON checks pass.
+- [x] Review final changes and update the next-agent handoff; Markdown lint and whitespace checks pass. Signing and pilot publication remain separate gates; do not publish changed unsigned bytes.
+
+Validation is local only. The fake-winget harness uses mocked SYSTEM identity and
+does not install real packages. The edited agent's stale signature block was removed;
+Get-AuthenticodeSignature reports NotSigned. Existing published/cached releases and
+live policy remain unchanged. Follow-up release gates: sign and timestamp with the
+approved certificate, independently verify Valid signatures, merge sample rules into
+the live policy without overwriting its other values, publish and refresh the pilot
+cache only when authorized, then verify real outcomes. No commit or push occurred.
+No reusable skill/plugin changed, so marketplace synchronization is not applicable.
+Repo docs and Quick Memory apply; no script-execution FogBugz case or Vanta target
+was identified. Case 255215 remains the separate DNS dependency/observation case.
+
+### November 3 Latest Pilot Review And Handoff
+
+Baseline: read-only collection at 14:50-14:53 Central returned seven of the current
+17 members: DEVWKS01/03/05 and NEX-LAPTOP-01/03/05/06. All seven cached agents
+match the October 27 published hash and have Valid signatures. No task, installer,
+cache refresh or reboot was forced. Full fleet acceptance remains open.
+
+- [x] Correlate latest Machine/user terminals, Health, recent attempt JSON, saved notification/restart/deferral state, task conditions and targeted registry versions. No latest package-failure event, malformed JSONL or active-run/process evidence was collected.
+- [x] Supersede the old DEVWKS03 stale-cache concern: correct signed release, pointer verified November 2 and November 3 Machine completion with Azure CLI VerifiedNotOffered. Elevated SYSTEM-task XML/profile coverage is still limited by the filtered local token, not proof that tasks are missing.
+- [x] Record current Machine outcomes: DEVWKS01 and laptop 01 Completed; DEVWKS03/05 CompletedRestartRequired; laptop 03 NoPackagesSelected; laptops 05/06 skipped outside the maintenance window and report AgentAssessmentOverdue.
+- [x] Distinguish Storage Explorer's old hash failures from current state. DEVWKS05 now registers 1.47.0 and cleared its failure notice November 2; update actor unverified. LibreOffice has successful final MSI evidence with restart-to-finish, not a current download failure.
+- [ ] Restore overnight assessment coverage on laptop 05 (last real assessment October 30, Eastern time) and laptop 06 (November 1, Central). Both have StartWhenAvailable=true and WakeToRun=false. Investigate power/availability and scheduler evidence; preserve the approved 02:00-04:00 endpoint-local window. A daytime successful skip is not an assessment.
+- [ ] Coordinate separately approved restarts and verify activation: DEVWKS03 Java pending since October 30; DEVWKS05 PowerToys since October 29 and LibreOffice since October 31. Boot identities predate detection. Installed registry targets alone do not authorize clearing pending state.
+- [ ] Diagnose Teams/native-updater coverage or propose a narrowly approved product rule with tests: the first-numeric-component major check defers build 26260 to 26276. Do not disable major guards globally.
+- [ ] Diagnose NoApplicableInstaller in the affected context: DEVWKS03 Microsoft.Azd 1.34.200 to 1.37.300 cached until November 5; DEVWKS05 user Rustlang.Rustup 1.29.1 to 1.29.2 until November 8. Both exit 0x8A150010 before installer start; exact registration/applicability causes remain unproven.
+- [ ] Reconcile Unknown user scope for Windows Terminal, WinDbg, Keeper Desktop and ChatGPT using authoritative package registration and deterministic fixtures. Keep the User-only guard; NoPackagesSelected is not full compliance.
+- [ ] Reconcile ten unavailable members. NEX-LAPTOP-02/04 and SCM-LAPTOP2 have no A record after approved stale cleanup; seven other members fail WinRM. Their latest state is unknown. Verify reconnect identity/registration rather than recreating old wrong addresses or weakening Kerberos.
+- [ ] Preserve bad-hash holds, evaluate generic integrity-failure classification/quarantine as a future tested change, and complete November 13 DNS observation in case 255215. Microsoft.WinGet.Client and outside-window read-only post-boot reconciliation remain future iterations.
+
+The canonical detailed next-agent queue, full population, expected release hashes,
+state paths, evidence limitations and authorization boundaries are in the SysOps
+[latest pilot handoff](E:/Sandbox/SysOps-And-CyberSecurity/docs/runbooks/nexport-danmade-patch-agent-gpo-pilot-2026-06-23.md#november-3-latest-pilot-review-and-next-agent-handoff).
+Raw receipts are local-only under
+`E:\Sandbox\SysOps-And-CyberSecurity\.scratch\patch-agent-review-20261103-205036`;
+they are not committed or attached and must be recollected elsewhere. Earlier
+source-control baselines remain 0d5f725 (agent) and 2dac218 (SysOps). No production
+source/signature/policy change or new full-suite test run occurred for this docs
+handoff; the preceding same-day six-suite checkpoint passed 124 checks/scenarios.
+
 ### November 3 Progress And Source-Control Checkpoint
 
 - [x] Reconcile the October 27 outcome/Health fixes with source and published bytes; retain NoApplicableInstaller administrator deferrals, bad-hash quarantine after review deadlines, Chrome-only major upgrades, SQL Developer ManualOnly and exact-target failure-notice transfer.
@@ -26,7 +199,7 @@ and unavailable policy falls back to broad defaults.
 - [x] Record selective DNS correction and aging observation in [case 255215](https://darwin-global.fogbugz.com/f/cases/255215/), Active and assigned to Daniel Pupek. Five confirmed obsolete VPN A records were removed; nexport.local aging is enabled with 3-day no-refresh and 7-day refresh. Both DNS servers retain automatic scavenging disabled. This shared-zone correction is not patch-agent rollout expansion.
 - [ ] Review timestamp registration, static exclusions and unexplained old records on or after November 13 in case 255215. Future scavenging/additional deletions require separate approval; rapid VPN address reuse remains a separate registration/ownership concern.
 - [ ] Investigate the current DEVWKS03 domain-based SYSVOL access limitation: Get-FileHash through nexport.local returns "The request is not supported" while both direct DC shares return the expected agent hash. The referral target could not be captured because dfsutil.exe is unavailable. Do not infer a server outage or flush/change DFS/network configuration from this observation alone.
-- [ ] Revalidate the local protected cache and full 17-member acceptance, then evaluate actual next-window package outcomes and pending restart targets. The seven remote Refresh/Health successes are October 27 evidence, not a new fleet scan; DEVWKS03 and the other unverified members remain open.
+- [ ] Complete elevated local task-XML and full 17-member acceptance, then evaluate actual next-window package outcomes and pending restart targets. The later 14:50 review confirms DEVWKS03's correct cache and Machine/User execution; the earlier cache concern is superseded. Seven remote Refresh/Health successes retain their October 27 evidence date. Ten members remain unverified in the latest read-only review.
 - [ ] Review the four VS Code release-hold deadlines due November 3; unchanged bad hashes remain quarantined after the deadline. Azure Developer CLI applicability and future Microsoft.WinGet.Client evaluation remain separate work.
 
 Current-checkpoint receipts are local-only under
@@ -117,6 +290,66 @@ The final release manifest and replica readback are under
 No package task was forced, no processes were stopped, and no GPO actions changed.
 
 ## Final Validation
+
+November 6 read-only validation: seven of eight readable caches are on the latest
+release, all eight signatures are Valid and both DC publication hashes still
+match. WinDbg on DEVWKS03 and Terminal on laptop 02 have real verified upgrade
+outcomes. App-restart handling, laptop 03 refresh/Health visibility, Zoom compound
+version proof and nine unverified members remain acceptance gaps. No production
+code changed or new release was published in this review.
+
+Latest November 4, 17:30 Central: main-package correction is signed/timestamped and
+published agent-only, SHA256 2FCCB1A6E7E5DDB1F673E4F0CA23C7374A11D6B67D0A1794FF9839978B476EB0,
+verified on both DCs. All seven release hashes agree; all five PS1 signatures are
+Valid/timestamped. Existing policy/ACLs/GPO bytes and 22/0 AD revision, plus the
+17-member pilot, are preserved. Staged AllSigned WhatIf passed. Prior local-only
+unsigned statements below are historical. Actual cache/User acceptance remains
+pending natural refresh; no task/installer/reboot/GPO change or commit/push.
+
+November 4 follow-up: main-only AppX correction is locally implemented and reviewed;
+174 regression scenarios/checks pass, plus real current-user function-only proof.
+Edited agent is NotSigned and unpublished; existing live/cached release remains
+Valid. DEVWKS03 cache converged before this diagnosis and its current UNC paths,
+DFS target and AllSigned WhatIf checks pass. Laptop 03 startup failure remains
+open pending exact SYSTEM evidence. No refresh/patch task, GPO, trust, network,
+cache or reboot mutation was performed by this work; no commit/push occurred.
+
+November 4 read-only check: six new signed caches among seven readable members,
+six overnight assessments and eight verification-backed successes; no new package
+failure in the bounded sample. DEVWKS03 cache refresh and laptop 05 overdue coverage
+remain unresolved. The Main+Bundle scope defect is reproduced with live registration
+and production function-only reads on laptop 01; a code fix/test/release is pending.
+No new reboot validates post-reboot target proof, and ten members lack readback.
+
+Latest November 3 authorized publication: signed agent and merged live policy
+match the new hashes above on both DCs. All five release PS1 files are Valid and
+timestamped, all seven release file hashes agree, GPO versions remain 22/0 and
+the group remains 17 members. Cache installer AllSigned WhatIf passed. Published
+files retain their original ACLs. Real cache convergence and package/reboot outcomes
+remain pending natural scheduled execution. Earlier unsigned statements below are
+historical local validation, not current source-signature state. No commit/push.
+
+Subsequent November 3 local implementation: all seven Windows PowerShell 5.1 suites
+passed, 166 checks/scenarios total. Four changed PS1 files parse, sample JSON loads,
+all four changed Markdown files pass lint, and git diff --check is clean in both
+workspaces. The final regression transcript is source-local
+`.scratch\verification-coverage-20261103-160032\regressions.txt`.
+Edited source agent SHA256 is
+0ED3A30E5D01668465D3AD0AE3BADB903C90EE52DD0B13A42A013D0A4CFBF573,
+NotSigned; sample policy SHA256 is
+1160FCA1226D0C6B8323CA9F62655C7C90C930843D30A14D909D3CE8E0441C46.
+These are not deployed release hashes. Signing, policy reconciliation, publication,
+real SYSTEM execution and next-window/reboot acceptance remain pending. No live
+mutation, commit or push occurred. The earlier review/publication evidence below
+describes the unchanged deployed release, not these edited local bytes.
+
+Latest November 3 review: seven of 17 members returned readable Machine/user logs
+and current cached-agent hashes/Valid signatures; five Machine lanes assessed
+November 3 and two are overdue after daytime skips. No latest package-failure
+events or active-run/process evidence were collected. Two endpoints still need
+restart verification, and ten members lack current readback. DEVWKS03's previous
+cache concern is superseded; elevated task-XML acceptance remains distinct. No
+code, signing, policy or endpoint change occurred for this handoff.
 
 November 3: all six local suites passed again, 124 checks/scenarios total; eight
 script parser checks and sample-policy JSON validation passed. All five release

@@ -89,7 +89,7 @@ $script:Policy.wazuhReporting.eventLog = $false
 Initialize-AgentStorage
 function Get-SystemBootTime { [datetime]'2026-10-16' }
 $record = [pscustomobject]@{ id='Test.Runtime'; name='Runtime'; available='8.0.32'; source='winget'; bootTimeAtDetection='2026-10-01'; evidencePath='fixture' }
-$offer = [pscustomobject]@{ Id='Test.Runtime'; Installed='8.0.32'; Available='8.0.33'; Source='winget' }
+$offer = [pscustomobject]@{ Id='Test.Runtime'; Installed='8.0.32'; Available='8.0.33'; Source='winget'; InstallScope='Machine' }
 New-Item -ItemType Directory -Path (Split-Path (Get-RestartVerificationStatePath)) -Force | Out-Null
 @{packages=@($record)} | ConvertTo-Json -Depth 5 | Set-Content (Get-RestartVerificationStatePath)
 Assert-Equal (Test-Path (Get-RestartVerificationStatePath)) $true 'Pending reboot fixture must exist.'

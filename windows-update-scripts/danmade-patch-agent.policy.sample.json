@@ -5,6 +5,30 @@
   "blockedPackageIds": [],
   "packageRules": [
     {
+      "id": "Microsoft.Teams",
+      "mode": "NativeUpdater",
+      "appxPackageFamilyNames": ["MSTeams_8wekyb3d8bbwe"]
+    },
+    {
+      "id": "Microsoft.Teams.Free",
+      "mode": "NativeUpdater"
+    },
+    {
+      "id": "Microsoft.WindowsTerminal",
+      "mode": "Auto",
+      "appxPackageFamilyNames": ["Microsoft.WindowsTerminal_8wekyb3d8bbwe"]
+    },
+    {
+      "id": "Microsoft.WinDbg",
+      "mode": "Auto",
+      "appxPackageFamilyNames": ["Microsoft.WinDbg_8wekyb3d8bbwe"]
+    },
+    {
+      "id": "OpenAI.ChatGPT",
+      "mode": "Auto",
+      "appxPackageFamilyNames": ["OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0"]
+    },
+    {
       "id": "OpenJS.NodeJS",
       "mode": "ManualOnly",
       "allowMajorVersion": false,

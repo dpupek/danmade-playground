@@ -43,6 +43,9 @@ $script:Policy = $null
 $script:JsonlPath = $null
 $script:WingetCommand = $null
 $script:CachedUninstallEntries = $null
+$script:CachedUserAppxPackages = $null
+$script:SelectionCounts = $null
+$script:ApplicabilityDeferredCount = 0
 $script:RunDeadline = $null
 $script:ActiveRunStatePath = $null
 $script:InapplicableUpgradeStatePath = $null
@@ -126,6 +129,10 @@ function Convert-ToPackageRules {
 
       $installerType = ([string](Get-PropertyValue -Object $rule -Name 'installerType' -Default '')).Trim().ToLowerInvariant()
       if ($installerType -and $installerType -notin @('wix', 'msi', 'msix', 'exe', 'inno', 'nullsoft', 'burn')) { $installerType = '' }
+      $families = @(Convert-ToStringArray -Value (Get-PropertyValue $rule 'appxPackageFamilyNames' @()))
+      foreach ($family in $families) {
+        if ($family -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]*_[a-z0-9]{13}$') { throw 'AppX package family names must be exact identities, including publisher ID.' }
+      }
 
       [pscustomobject]@{
         id                = $id.Trim()
@@ -134,6 +141,7 @@ function Convert-ToPackageRules {
         processNames      = Convert-ToStringArray -Value (Get-PropertyValue -Object $rule -Name 'processNames' -Default @())
         installerType     = $installerType
         releaseHolds      = @(Get-PropertyValue -Object $rule -Name 'releaseHolds' -Default @())
+        appxPackageFamilyNames = $families
       }
     }
   )
@@ -218,6 +226,7 @@ function Import-AgentPolicy {
     }
     foreach ($rule in @($loaded.packageRules)) {
       if (-not $rule.id -or $rule.mode -notin @('Auto', 'ManualOnly', 'QuiescenceRequired', 'NativeUpdater')) { throw 'Invalid package rule.' }
+      if ($rule.PSObject.Properties['appxPackageFamilyNames'] -and $rule.appxPackageFamilyNames -isnot [array]) { throw 'AppX package families must be an array.' }
       foreach ($hold in @(Get-PropertyValue -Object $rule -Name 'releaseHolds' -Default @())) {
         $until = [datetime]::MinValue
         if (-not $hold.version -or $hold.scope -notin @('machine','user') -or $hold.installerSha256 -notmatch '^[a-fA-F0-9]{64}$' -or -not [datetime]::TryParse([string]$hold.until, [ref]$until) -or -not $hold.reason) { throw 'Invalid release hold.' }
@@ -677,15 +686,25 @@ function Resolve-PendingRestartVerification {
       Write-AgentEvent -EventId 5300 -EntryType Warning -Fields @{ packageId = [string]$entry.id; status = 'DeferredRestartVerificationPendingReboot'; restartRequired = $true; evidencePath = [string]$entry.evidencePath } | Out-Null
       continue
     }
-    $stillOffered = -not (Test-PackageTargetSatisfied -Package $entry -AvailablePackages $AvailablePackages)
-    if ($stillOffered) {
-      $failedPackage = @($AvailablePackages | Where-Object { [string]::Equals([string]$_.Id, [string]$entry.id, [System.StringComparison]::OrdinalIgnoreCase) -and [string]::Equals([string]$_.Source, [string]$entry.source, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1)[0]
+    $targetSatisfied = Test-RecordedTargetInstalled -Package $entry -AvailablePackages $AvailablePackages
+    $offers = @($AvailablePackages | Where-Object { $_.Id -eq $entry.id -and $_.Source -eq $entry.source -and (Get-PropertyValue $_ 'InstallScope' '') -eq $Mode })
+    $target = $null
+    $belowTarget = @($offers | Where-Object {
+      $installed = $null
+      [version]::TryParse([string]$entry.available, [ref]$target) -and [version]::TryParse([string]$_.Installed, [ref]$installed) -and $installed -lt $target
+    })
+    if (-not $targetSatisfied -and $belowTarget.Count -eq 1 -and $offers.Count -eq 1) {
+      $failedPackage = $belowTarget[0]
       $failed.Add($failedPackage)
       [void]$deferred.Add([string]$entry.id)
       Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{ packageId = [string]$entry.id; status = 'RestartVerificationFailedStillOffered'; evidencePath = [string]$entry.evidencePath } | Out-Null
-    } else {
+    } elseif ($targetSatisfied) {
       $resolved.Add([string]$entry.id)
       Write-AgentEvent -EventId 5100 -EntryType Information -Fields @{ packageId = [string]$entry.id; status = 'RestartVerificationResolved'; evidencePath = [string]$entry.evidencePath } | Out-Null
+    } else {
+      [void]$deferred.Add([string]$entry.id)
+      $remaining.Add($entry)
+      Write-AgentEvent -EventId 5601 -EntryType Warning -Fields @{ packageId = [string]$entry.id; status = 'RestartVerificationInconclusive'; requiresAdminRemediation = $true; reason = 'InstalledTargetNotProvenAfterReboot'; evidencePath = [string]$entry.evidencePath } | Out-Null
     }
   }
   if ($remaining.Count -eq 0) {
@@ -706,26 +725,32 @@ function Test-RecordedTargetInstalled {
   $target = $null
   if (-not [version]::TryParse([string]$Package.available, [ref]$target)) { return $false }
   $matchedOffer = $false
-  foreach ($offer in @($AvailablePackages)) {
-    if ($offer.Id -ne $Package.id -or $offer.Source -ne $Package.source) { continue }
+  $offers = @($AvailablePackages | Where-Object { $_.Id -eq $Package.id -and $_.Source -eq $Package.source })
+  if ($offers.Count -gt 1) { return $false }
+  foreach ($offer in $offers) {
     $matchedOffer = $true
     $installed = $null
-    if ([version]::TryParse([string]$offer.Installed, [ref]$installed) -and $installed -ge $target) { return $true }
+    if ((Get-PropertyValue $offer 'InstallScope' '') -eq $Mode -and [version]::TryParse([string]$offer.Installed, [ref]$installed) -and $installed -ge $target) { return $true }
   }
   if ($matchedOffer) { return $false }
   # Absence from the upgrade list alone is not proof: require an exact, unique ARP name and scope.
   $name = Normalize-DisplayText -Text ([string]$Package.name)
   if (-not $name) { return $false }
-  $entries = @(Get-CachedUninstallEntries | Where-Object { $_.DisplayNameNorm -eq $name -and (Get-ScopeFromEntry -Entry $_) -eq $Mode })
-  if ($entries.Count -ne 1) { return $false }
+  $entries = @(Get-CachedUninstallEntries | Where-Object { $_.DisplayNameNorm -eq $name })
+  if ($entries.Count -gt 1) { return $false }
   $installed = $null
-  return ([version]::TryParse([string]$entries[0].DisplayVersion, [ref]$installed) -and $installed -ge $target)
+  if ($entries.Count -eq 1) {
+    return ((Get-ScopeFromEntry $entries[0]) -eq $Mode -and [version]::TryParse([string]$entries[0].DisplayVersion, [ref]$installed) -and $installed -ge $target)
+  }
+  $appx = @(Get-MatchingUserAppxPackages -Package $Package)
+  return ($appx.Count -eq 1 -and [version]::TryParse([string]$appx[0].Version, [ref]$installed) -and $installed -ge $target)
 }
 
 function Resolve-RecordedPackageState {
   param([object[]]$AvailablePackages, [string[]]$ResolvedRestartIds)
   if ($WhatIfPreference) { return }
   $script:CachedUninstallEntries = $null
+  $script:CachedUserAppxPackages = $null
   $statePath = Get-NotificationStatePath
   if (Test-Path -LiteralPath $statePath) {
     try {
@@ -1047,6 +1072,28 @@ function Get-ScopeFromEntry {
   return 'Unknown'
 }
 
+function Get-CachedUserAppxPackages {
+  if ($Mode -ne 'User' -or (Test-IsSystemAccount)) { return @() }
+  if ($null -ne $script:CachedUserAppxPackages) { return $script:CachedUserAppxPackages }
+  try {
+    # Query this user's main packages: bundle versions are not installed application versions.
+    $script:CachedUserAppxPackages = @(Get-AppxPackage -PackageTypeFilter Main -ErrorAction Stop |
+      Where-Object { [int]$_.Status -eq 0 -and -not $_.IsFramework -and -not $_.IsResourcePackage -and (Get-PropertyValue $_ 'IsBundle' $true) -eq $false })
+  } catch {
+    $script:CachedUserAppxPackages = @()
+  }
+  return $script:CachedUserAppxPackages
+}
+
+function Get-MatchingUserAppxPackages {
+  param([object]$Package)
+  $rule = Get-PackageRule -PackageId ([string]$Package.Id)
+  if (-not $rule) { return @() }
+  $families = @(Get-PropertyValue $rule 'appxPackageFamilyNames' @())
+  if ($families.Count -eq 0) { return @() }
+  return @(Get-CachedUserAppxPackages | Where-Object { $families -contains [string]$_.PackageFamilyName })
+}
+
 function Resolve-PackageInstallScope {
   param([object]$Package)
 
@@ -1058,6 +1105,7 @@ function Resolve-PackageInstallScope {
   if (-not $packageNameNorm) { return 'Unknown' }
 
   $bestMatch = $null
+  $bestMatchCount = 0
   $bestScore = -1
   foreach ($entry in @(Get-CachedUninstallEntries)) {
     if (-not $entry.DisplayNameNorm) { continue }
@@ -1075,13 +1123,22 @@ function Resolve-PackageInstallScope {
       $score = 70
     }
 
+    if ($score -lt 0) { continue }
     if ($score -gt $bestScore) {
       $bestScore = $score
       $bestMatch = $entry
+      $bestMatchCount = 1
+    } elseif ($score -eq $bestScore) {
+      $bestMatchCount++
     }
   }
 
-  if (-not $bestMatch) { return 'Unknown' }
+  if ($bestMatchCount -gt 1) { return 'Unknown' }
+  if (-not $bestMatch) {
+    if (@(Get-MatchingUserAppxPackages -Package $Package).Count -eq 1) { return 'User' }
+    return 'Unknown'
+  }
+  if ((Get-ScopeFromEntry -Entry $bestMatch) -ne 'User' -and @(Get-MatchingUserAppxPackages -Package $Package).Count -gt 0) { return 'Unknown' }
   return Get-ScopeFromEntry -Entry $bestMatch
 }
 
@@ -1360,6 +1417,7 @@ function Select-PolicyPackages {
   )
 
   $script:SelectionDeferredCount = 0
+  $script:SelectionCounts = @{ blockedCount = 0; notAllowedCount = 0; nativeUpdaterCount = 0; manualOnlyCount = 0; majorVersionDeferredCount = 0; processInUseCount = 0; scopeUnknownCount = 0; scopeMismatchCount = 0; restartDeferredCount = 0 }
   $deferred = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
   foreach ($id in @($DeferredPackageIds)) { if ($id) { [void]$deferred.Add([string]$id) } }
 
@@ -1372,8 +1430,9 @@ function Select-PolicyPackages {
   return @(
     foreach ($pkg in @($Packages)) {
       if (-not $pkg.Id) { continue }
-      if ($deferred.Contains([string]$pkg.Id)) { $script:SelectionDeferredCount++; continue }
+      if ($deferred.Contains([string]$pkg.Id)) { $script:SelectionDeferredCount++; $script:SelectionCounts.restartDeferredCount++; continue }
       if ($blocked.Contains([string]$pkg.Id)) {
+        $script:SelectionCounts.blockedCount++
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
           status    = 'SkippedBlocked'
@@ -1381,6 +1440,7 @@ function Select-PolicyPackages {
         continue
       }
       if ($allowed.Count -gt 0 -and -not $allowed.Contains([string]$pkg.Id)) {
+        $script:SelectionCounts.notAllowedCount++
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
           status    = 'SkippedNotAllowed'
@@ -1389,6 +1449,7 @@ function Select-PolicyPackages {
       }
       $rule = Get-PackageRule -PackageId ([string]$pkg.Id)
       if ($rule -and $rule.mode -eq 'NativeUpdater') {
+        $script:SelectionCounts.nativeUpdaterCount++
         $script:SelectionDeferredCount++
         Write-AgentEvent -EventId 5101 -EntryType Warning -Fields @{
           packageId = [string]$pkg.Id; status = 'DeferredNativeUpdater'
@@ -1398,6 +1459,7 @@ function Select-PolicyPackages {
         continue
       }
       if ($rule -and $rule.mode -eq 'ManualOnly') {
+        $script:SelectionCounts.manualOnlyCount++
         $script:SelectionDeferredCount++
         Move-FailureNotificationToAdminDeferral -Package $pkg -Reason 'ManualOnly'
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
@@ -1410,6 +1472,7 @@ function Select-PolicyPackages {
 
       $allowMajorVersion = if ($rule) { [bool]$rule.allowMajorVersion } else { $false }
       if ((Test-PackageMajorUpgrade -Package $pkg) -and -not $allowMajorVersion) {
+        $script:SelectionCounts.majorVersionDeferredCount++
         $script:SelectionDeferredCount++
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
@@ -1423,6 +1486,7 @@ function Select-PolicyPackages {
       if ($rule -and $rule.mode -eq 'QuiescenceRequired') {
         $runningProcesses = @(Get-RunningRuleProcesses -Rule $rule)
         if ($runningProcesses.Count -gt 0) {
+          $script:SelectionCounts.processInUseCount++
           $script:SelectionDeferredCount++
           Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
             packageId = [string]$pkg.Id
@@ -1436,6 +1500,7 @@ function Select-PolicyPackages {
 
       $scope = if ($pkg.PSObject.Properties['InstallScope']) { [string]$pkg.InstallScope } else { 'Unknown' }
       if ($Mode -eq 'User' -and $scope -ne 'User') {
+        if ($scope -eq 'Unknown') { $script:SelectionCounts.scopeUnknownCount++ } else { $script:SelectionCounts.scopeMismatchCount++ }
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
           status    = 'InventoryScopeMismatch'
@@ -1445,6 +1510,7 @@ function Select-PolicyPackages {
         continue
       }
       if ($Mode -eq 'Machine' -and $scope -eq 'User') {
+        $script:SelectionCounts.scopeMismatchCount++
         Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
           packageId = [string]$pkg.Id
           status    = 'InventoryScopeMismatch'
@@ -1457,6 +1523,23 @@ function Select-PolicyPackages {
       $pkg
     }
   )
+}
+
+function Get-AssessmentSummaryFields {
+  param([int]$DiscoveredCount, [int]$SelectedCount, [hashtable]$Summary, [int]$CarriedRestartCount)
+  $pending = $CarriedRestartCount + $Summary.RestartRequired
+  $fields = @{
+    assessmentCompleted = $true
+    assessmentOutcome = $(if ($DiscoveredCount -eq 0) { 'NoUpdatesOffered' } elseif ($SelectedCount -eq 0) { 'NoEligibleUpdates' } else { 'UpdatesProcessed' })
+    coverageStatus = $(if ($SelectedCount -lt $DiscoveredCount -or $Summary.Failed -gt 0 -or $Summary.Deferred -gt 0 -or $pending -gt 0) { 'UnresolvedOffers' } else { 'NoUnresolvedOffers' })
+    discoveredCount = $DiscoveredCount; selectedCount = $SelectedCount; deferredCount = $Summary.Deferred
+    succeededCount = $Summary.Succeeded; failedCount = $Summary.Failed
+    applicabilityDeferredCount = $script:ApplicabilityDeferredCount
+    restartRequired = ($pending -gt 0); pendingRestartCount = $pending
+    newRestartCount = $Summary.RestartRequired; carriedRestartCount = $CarriedRestartCount
+  }
+  foreach ($key in $script:SelectionCounts.Keys) { $fields[$key] = $script:SelectionCounts[$key] }
+  return $fields
 }
 
 function ConvertFrom-InstallerLogText {
@@ -1771,6 +1854,7 @@ function Invoke-PackageUpgrade {
   }
   $existingDeferral = Get-InapplicableUpgradeDeferral -Package $Package
   if ($existingDeferral) {
+    if ((Get-PropertyValue $existingDeferral 'reason' '') -in @('NoApplicableUpgrade', 'NoAvailableUpgrade', 'InstallerTechnologyMismatch', 'InstalledPackageNotFound', 'NoApplicableInstaller')) { $script:ApplicabilityDeferredCount++ }
     Write-AgentEvent -EventId 5101 -EntryType Information -Fields @{
       packageId     = [string]$Package.Id
       status        = 'Deferred' + (Get-PropertyValue -Object $existingDeferral -Name 'reason' -Default 'NoApplicableUpgrade') + 'Cached'
@@ -1932,6 +2016,7 @@ function Invoke-PackageUpgrade {
     }
 
     if ($commandOutcome.Status -in @('NoApplicableUpgrade', 'NoAvailableUpgrade', 'InstallerTechnologyMismatch', 'InstalledPackageNotFound', 'NoApplicableInstaller')) {
+      $script:ApplicabilityDeferredCount++
       $deferredUntil = Set-InapplicableUpgradeDeferral -Package $Package -EvidencePath $evidencePath -CommandOutcome $commandOutcome
       if ($commandOutcome.Status -eq 'NoApplicableInstaller') { Move-FailureNotificationToAdminDeferral -Package $Package -Reason 'NoApplicableInstaller' -EvidencePath $evidencePath }
       $adminRemediation = $commandOutcome.Status -in @('InstallerTechnologyMismatch','InstalledPackageNotFound','NoApplicableInstaller')
@@ -2127,17 +2212,9 @@ try {
   }
 
   if ($selectedPackages.Count -eq 0 -and $summary.Failed -eq 0) {
-    Write-AgentEvent -EventId 5001 -EntryType Information -Fields @{
-      status = if ($restartVerification.PendingRestartCount -gt 0) { 'CompletedRestartRequired' } else { 'NoPackagesSelected' }
-      assessmentCompleted = $true
-      discoveredCount = $availablePackages.Count
-      selectedCount = 0
-      deferredCount = $summary.Deferred
-      restartRequired = ($restartVerification.PendingRestartCount -gt 0)
-      pendingRestartCount = $restartVerification.PendingRestartCount
-      newRestartCount = 0
-      carriedRestartCount = $restartVerification.PendingRestartCount
-    } | Out-Null
+    $fields = Get-AssessmentSummaryFields -DiscoveredCount $availablePackages.Count -SelectedCount 0 -Summary $summary -CarriedRestartCount $restartVerification.PendingRestartCount
+    $fields.status = if ($restartVerification.PendingRestartCount -gt 0) { 'CompletedRestartRequired' } else { 'NoPackagesSelected' }
+    Write-AgentEvent -EventId 5001 -EntryType Information -Fields $fields | Out-Null
     Clear-NotificationState -PreserveRestartRequired
     exit 0
   }
@@ -2156,19 +2233,11 @@ try {
 
   $pendingRestartCount = $summary.RestartRequired + $restartVerification.PendingRestartCount
   $finalStatus = if ($summary.Failed -gt 0) { 'CompletedWithFailures' } elseif ($pendingRestartCount -gt 0) { 'CompletedRestartRequired' } else { 'Completed' }
-  Write-AgentEvent -EventId 5001 -EntryType Information -Fields @{
-    status          = $finalStatus
-    packageId       = '*'
-    assessmentCompleted = $true
-    discoveredCount = $availablePackages.Count
-    selectedCount = $selectedPackages.Count
-    deferredCount = $summary.Deferred
-    restartRequired = ($pendingRestartCount -gt 0)
-    pendingRestartCount = $pendingRestartCount
-    newRestartCount = $summary.RestartRequired
-    carriedRestartCount = $restartVerification.PendingRestartCount
-    recoveryActions = @("Succeeded=$($summary.Succeeded)", "RestartRequired=$($summary.RestartRequired)", "Failed=$($summary.Failed)", "Deferred=$($summary.Deferred)")
-  } | Out-Null
+  $fields = Get-AssessmentSummaryFields -DiscoveredCount $availablePackages.Count -SelectedCount $selectedPackages.Count -Summary $summary -CarriedRestartCount $restartVerification.PendingRestartCount
+  $fields.status = $finalStatus
+  $fields.packageId = '*'
+  $fields.recoveryActions = @("Succeeded=$($summary.Succeeded)", "RestartRequired=$($summary.RestartRequired)", "Failed=$($summary.Failed)", "Deferred=$($summary.Deferred)")
+  Write-AgentEvent -EventId 5001 -EntryType Information -Fields $fields | Out-Null
   if ($finalStatus -eq 'Completed') {
     Clear-NotificationState -PreserveRestartRequired
   } else {
@@ -2199,8 +2268,8 @@ try {
 # SIG # Begin signature block
 # MIIgEQYJKoZIhvcNAQcCoIIgAjCCH/4CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCSCT+Cd7zvgt4S
-# Yq1U3GiXeX9jytkhaGymmYJ2jKZH2KCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBvi9znOy3shkJn
+# SKAk/onM24U95VRPgeWMPDN4Sf1PfKCCGiwwggWNMIIEdaADAgECAhAOmxiO+dAt
 # 5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUAMGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQK
 # EwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5jb20xJDAiBgNV
 # BAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQgUm9vdCBDQTAeFw0yMjA4MDEwMDAwMDBa
@@ -2344,29 +2413,29 @@ try {
 # BgoJkiaJk/IsZAEZFgduZXhwb3J0MRYwFAYDVQQDEw1uZXhwb3J0LWxvY2FsAhNW
 # AAAA+7iPxuX14sCEAAEAAAD7MA0GCWCGSAFlAwQCAQUAoIGEMBgGCisGAQQBgjcC
 # AQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYB
-# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIHe8hmHsMWKk
-# EsdihzgZaSZAyk8hvEwZsymEyyNbVa9nMA0GCSqGSIb3DQEBAQUABIIBAEVvT1cy
-# et+M6SoQx1DLIZpsJGvzyDspdsSoNmATyciKLpS0lwnX30EL4aCPkQ8tMLy3IpUt
-# Gn8JmdQLjKt3tjGyyaE6qNV4af/nEq8eE4NhvidvOPBSRMX3vIKfjBOb5CSJ6lXk
-# nzY9QD3UNqrEU9uzBmwoTax0ECUvwWMzlQ3ISR3bUGaoJafj9T4orAlWf3dKYL+4
-# JSnYXdmdVpZ8xJtS/uy1EBymqxTsBJu9tQMzIwEMkA+9OMjNDKk953Tnu7JAHgVP
-# OjtVagnbkg00+yI/ZEj0NwGt6r1QXVkdQJen58Y+MJzHIqRmkCxXaaEkzCGqK7sE
-# cBFNGY5Be8zerpyhggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
+# BAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIG/F6KQP2YC+
+# EXvdD13kMxRf42wkeKvqYpBY8myOStVbMA0GCSqGSIb3DQEBAQUABIIBAEqCVtcC
+# C/GyxsqDD9tmERKW8I3avXEK8S7f6NGecTg+rak+kpAtjgnjleLJZLgZdndRiVIo
+# nGhhp+3hs3kKzyGTNNlrZfiE4MOUDRHYj3kXHkem4lmorK11hcNa8uLk8StMl2Vx
+# KFXCrhhW4i1RAyCdLLYHpzwyrQBJ0NNtfJWvwGSKLFqYb1Ws+ctlBx9YrAtVqtdv
+# yus3tAaXCeuDJSVdfHBJ4Jv956JS6yTOLoKDViQzqgo5qHMSkBHIFUliDDFznSuL
+# asfUBBkODH15sbB/PE0PRyddM3GQNc2T6hf0sbYe75n7fTTzzEqVeKLwcQ6Z9D5V
+# N5zsl8+4ep7mjQ+hggMmMIIDIgYJKoZIhvcNAQkGMYIDEzCCAw8CAQEwfTBpMQsw
 # CQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERp
 # Z2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIw
 # MjUgQ0ExAhAIT9wzT35FTtvDD4/5khg1MA0GCWCGSAFlAwQCAQUAoGkwGAYJKoZI
-# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYxMDI3MTM1ODM2
-# WjAvBgkqhkiG9w0BCQQxIgQgo+XDpRWTeu9Jn6odUjwSZHN2W48oqv/Fxbn+qnUS
-# PzkwDQYJKoZIhvcNAQEBBQAEggIAmjw0IPvvgobfQ6w+5rmqqNUlyvk6yurJo2Ak
-# uIQ1DsK4Pq4hCLDp37FS7wzPr2j6wi+nxrq9On+FpMwBO/Njqe3jG3rhNwOW4oZq
-# gWZpZMF7Yk+b5htIcvk4wV93BjZYNj6fhZEDKQF/do7oZu++jDcZhLQUrjbqnT2C
-# YAGZFy1Ln9BsLEOj7cbwcHrFDFYdwKWMqyzN3LsG/9nPoclB9zlmy6BhQgzDjURh
-# GB7bBSGHv6S/OLMVBEE/DKliv1KuQfLUpYub/i6FPgjFyytbvVvoO2L1zNpruLCD
-# ZuSQUcO+C+W+0QFjrBp0oPJMbqGTpSxNmiiHygcoTIQKw5Gj9vEbf6dAurtYgLwB
-# D50++40HaAmE41h367KECEWJUT5L4SyRbNmYSVNu9t32GHThcCqS8J788cxe9JXr
-# 2XSUU6YsgOR0N0FU7h+l9sXNaZ8JKGLMFIuC8YRdae5phQ8MXGVNUMWAJI6DarGb
-# YHL55WVMVnkbiXLayBPYWzTqaJTcv/Yj1jU73L44KOePc1Pp3j217V6Jd6pNaWgp
-# xO0JzpfxX8vQlI3gbn0Q0oyaVoLkZvxR1Yep0mXSvE8CJmYVlI93DKnsG4XPKmv3
-# 5rzWqcO+gP7ezTqv1IUUV7VVHFz47YH67TT8awUN599yqNM83jZh9m/h2MIine2j
-# FD4xgqM=
+# hvcNAQkDMQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYxMTA0MjMyOTM5
+# WjAvBgkqhkiG9w0BCQQxIgQgGj3/T9xyICs2utyhyzY8zR+2Uc9ZAGe6kRehfSH3
+# jF0wDQYJKoZIhvcNAQEBBQAEggIANKjSIi0OUrsBGKkocCDxlTBFde5ZzCyEBkLK
+# aez9XfiG6vJeOrqEQDEEGsaJryHomrdi4hOmssy2UaG18KTLxTO3fwvL+8sqXRf+
+# OQhl1LYtQzLflTZ39vrE2s20VGBiXLssYXru/Je44p3aHhCaAWX2YI2VKacVPbz5
+# bWFeRjSRXrBLmRZe1Ve5Q3iAd1wr8z4O1yPIhIAtJeGmb60SwFlgDK6zYrJ8jB1K
+# ENTwsgT88R1dwYiepDHDpffCcqI/LSH+p3gJym3kKbnGTex1+i3ebV1iwUQfMiSi
+# MUf73gPm5Q/+k/KTLtNRxxcesYjrA0nnzhJ6pfYirYlw2Vrq3Mo+KZSHfJJP+Gke
+# iOReo6D+cPZ2WD9BKEGO0ebTEYXcOvrQigFW0eHww2NaBBqGXYJ4nx1XibYCWdIV
+# uNUxn3TOTW4SHB6V1SH+sw/TW6vRdJXswXESFvniftgjss5fQjV4fmhbQhV/1cW4
+# PHM/9puuS5MOEWg7XJMFeTgZ620mKjkoZJ/ipxLPh6m2HXxVJ9VED/fWofKadeJb
+# WnETFpmUmolH/xipXJ7Ek7eFNzwkV8cZiT4YSZuNmOcp2V8S2NuJ80yjlUb4LZ2U
+# 5LfWp6LkLVHCHQmrjE1ySLLvglOBGUyffd3ATHkuM2OTjopfhaHroqPvrQVFFaat
+# z2RI0z0=
 # SIG # End signature block

@@ -97,6 +97,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/t
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentReliability.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentCacheAcl.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentPilotFixes.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows-update-scripts/tests/Test-PatchAgentCoverage.ps1
 ```
 
 `Bypass` is confined to local test fixtures. Production tasks remain `AllSigned`. The fake-winget harness replaces only host observation functions and retry sleeping in its scratch copy; default machine scenarios mock SYSTEM identity and do not prove real SYSTEM deployment. `-RunMachineAsSystem` optionally exercises actual temporary SYSTEM tasks from an elevated operator session. Cache dispatch tests mock signing APIs; real signature validation remains a separate release gate. Track rollout in the [reliability plan](../docs/danmade-patch-agent/reliability-plan.md).
@@ -120,6 +121,8 @@ For example, `PHP.PHP.8.2` and `PHP.PHP.8.3` are separate packages. Cleanup mode
 ## Validation
 
 The pilot outcome regressions are in [Test-PatchAgentPilotFixes.ps1](tests/Test-PatchAgentPilotFixes.ps1).
+Installed-target, exact current-user AppX identity, ambiguous registry and coverage
+disposition regressions are in [Test-PatchAgentCoverage.ps1](tests/Test-PatchAgentCoverage.ps1).
 Run with Windows PowerShell 5.1. They exercise applicability, notification ownership,
 Chrome/SQL selection, restart metadata and Health assessment freshness using local
 fixtures only. Release acceptance also requires the function, reliability, fake-winget,

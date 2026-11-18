@@ -1,6 +1,6 @@
 # Danmade Patch Agent Admin Guide
 
-Date: 2026-11-03
+Date: 2026-11-04
 
 Operator Level: Windows-first beginner operator (little Windows domain experience and no Linux experience)
 
@@ -460,6 +460,73 @@ Confirm:
 - Machine-mode package events do not include clearly per-user installs; user-mode package events include only clearly per-user installs.
 
 ## Operational Notes
+
+### Installed-Target Proof And Coverage Reporting
+
+Goal of this section: distinguish completed assessment, unresolved offers and
+installed-target verification without weakening installation safety.
+
+Operator note: contact Dan Pupek / Nexport Systems Architecture when registration
+or restart evidence is ambiguous. Do not bypass scope, signature or hash checks.
+
+After a restart, the agent requires both a later boot and positive evidence that
+the recorded target version or a newer version is installed in the same scope.
+An absent upgrade offer alone is insufficient. A unique same-source scoped offer,
+an exact unique same-scope uninstall registration, or a policy-pinned current-user
+AppX registration can supply version evidence. Ambiguous or unknown versions retain
+pending state as `RestartVerificationInconclusive`, requiring administrator review.
+Do not clear that state manually or ask users to reboot repeatedly without reviewing
+the evidence. A positively identified older version still offered after reboot
+remains `RestartVerificationFailedStillOffered`. Immediate post-install inventory
+verification remains separate and unchanged.
+
+Optional `appxPackageFamilyNames` on a package rule is an array of exact family names
+including publisher IDs. Current-user healthy main registrations are queried
+only in User mode, never with AllUsers or another user's identity. Wildcards and
+scalar values are rejected. Unconfigured identities, unhealthy registrations,
+multiple main registrations and equally ranked uninstall matches remain Unknown. A conflicting
+machine uninstall record and user AppX registration also remain Unknown. This does
+not weaken the existing User-only installation guard or prove other profiles patched.
+Keeper's identity is not configured until authoritative registration is collected.
+
+Bundle entries are excluded from scope and installed-version proof, even when
+their family matches. A normal main-plus-bundle pair is one main application, not
+ambiguous ownership. Bundle-only results, absent package-type metadata and unhealthy
+main registrations do not prove installation. Do not choose the highest version
+across main and bundle records: Terminal's bundle can report 3001.24.12741.0 while
+the installed main package reports 1.24.12741.0. The latter is the version compared
+with the recorded target. See [Get-AppxPackage package-type filtering](https://learn.microsoft.com/en-us/powershell/module/appx/get-appxpackage#-packagetypefilter).
+
+The sample policy pins Windows Terminal, WinDbg and ChatGPT families and delegates
+Teams and Teams Free to `NativeUpdater`. Teams therefore reports
+`DeferredNativeUpdater`, installed/offered versions and administrator follow-up,
+without invoking an installer or globally relaxing major-version policy. Delegation
+does not establish that the native updater ran; investigate persistent offers.
+See [Microsoft's Teams update lifecycle](https://learn.microsoft.com/en-us/microsoftteams/teams-client-update).
+The sample policy is not a replacement for the live policy: merge only the intended
+rules and preserve the pilot's existing retries, blocks and installation window.
+
+Terminal statuses and `assessmentCompleted` retain their existing meaning. New
+`assessmentOutcome` values distinguish `NoUpdatesOffered`, `NoEligibleUpdates` and
+`UpdatesProcessed`. `coverageStatus=UnresolvedOffers` marks skipped offers, deferrals,
+failures or pending restarts; `NoUnresolvedOffers` describes only that successful
+inventory assessment's observed scope, not full device/fleet compliance.
+
+Selection disposition fields are mutually exclusive: `blockedCount`,
+`notAllowedCount`, `manualOnlyCount`, `nativeUpdaterCount`,
+`majorVersionDeferredCount`, `processInUseCount`, `scopeUnknownCount`,
+`scopeMismatchCount` and `restartDeferredCount`. Scope counts describe skipped
+selection, not every unknown Machine inventory row. `succeededCount`, `failedCount`
+and `applicabilityDeferredCount` add attempt outcomes; the last includes cached
+applicability deferrals and is a subset of `deferredCount`, not another total to add.
+Existing discovered/selected/deferred and new/carried restart fields remain present.
+Blocked and scope-skipped offers are not retroactively added to `deferredCount`.
+
+Validate these rules with the tracked
+[coverage regressions](../../windows-update-scripts/tests/Test-PatchAgentCoverage.ps1)
+and fake-winget harness. Local fixture success does not prove endpoint behavior.
+Edited agent source must be signed and timestamped, independently verified Valid,
+and published through the existing cache-release process before production use.
 
 ### October 16 Reliability Rules
 
