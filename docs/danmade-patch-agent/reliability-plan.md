@@ -1,6 +1,6 @@
 # Patch Agent Reliability Hardening
 
-Date: 2026-11-18
+Date: 2026-11-24
 
 Operator Level: Windows-first beginner operator (little Windows domain experience and no Linux experience)
 
@@ -17,6 +17,20 @@ dependency. The current inventory reader can mistake failure for an empty list,
 and unavailable policy falls back to broad defaults.
 
 ## Iterations
+
+### November 24 .NET Post-Reboot Proof
+
+Baseline: the recorded uninstall name embeds the old version, and an MSI
+DisplayVersion can differ from the .NET product version. For example, the
+Desktop Runtime 8.0.34 registration reports 64.136.61676. Pending records
+remain inconclusive even when the exact target files are installed.
+
+- [x] Prove exact machine-wide SDK and shared-framework targets with the recorded architecture, matching .NET registration and payload, after the existing reboot gate. Leave unsupported Hosting Bundles on their existing path.
+- [x] Verify resolved state and notices are removed only for the matching package, source and target. Retain later or unproven targets and genuine first-reboot requests.
+- [x] Read the production proof function against live pending records: 16 eligible post-reboot targets verified on DEVWKS01/03/05 and NEX-LAPTOP-06. Two Hosting Bundle targets were excluded; NEX-LAPTOP-02 did not answer WinRM during this probe. State-file hashes were unchanged.
+- [x] Pass all seven Windows PowerShell 5.1 suites (210 checks/scenarios, 82 in Coverage), three changed-script parses, Markdown and whitespace checks. Rehearse reconciliation against scratch copies of five DEVWKS03 records: all five resolve, the scratch reboot notice clears, and the live state hash is unchanged.
+- [x] Sign and publish only the agent on November 24 at 13:13 Central. Both DCs and the domain SYSVOL path match the approved timestamped signature and SHA256 `66103EDC8C7BBA43D4CA63B3704B0B6414411177DF8C89835F2DB98ED2E0E6D9`; the staged AllSigned cache installer WhatIf passed. Supporting scripts, live policy, ACLs, task definitions, GPO revision 22/0 and 17-device pilot scope were unchanged. Receipt and verified rollback copy: `.scratch\pilot-activation-20261124-131301-4d459c07`.
+- [ ] Verify natural endpoint state reconciliation after the next scheduled Machine runs. All 16 proven targets on four sampled devices remained pending on their prior cache immediately after publication. None had a matching reboot notice before publication; verify that no notice returns rather than claim it was removed. Read-only baseline and comparison collector are under SysOps `.scratch`; see the pilot runbook.
 
 ### November 18 Application Activation, Refresh Health And Zoom
 

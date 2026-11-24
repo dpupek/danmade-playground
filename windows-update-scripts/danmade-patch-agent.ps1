@@ -735,7 +735,8 @@ function Resolve-PendingRestartVerification {
   $failed = New-Object System.Collections.Generic.List[object]
   $resolved = New-Object System.Collections.Generic.List[string]
   $review = New-Object System.Collections.Generic.List[object]
-  if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{ DeferredPackageIds = @(); FailedPackages = @(); ResolvedPackageIds = @(); ReviewPackages = @(); PendingRestartCount = 0 } }
+  $postBoot = New-Object System.Collections.Generic.List[object]
+  if (-not (Test-Path -LiteralPath $statePath)) { return [pscustomobject]@{ DeferredPackageIds = @(); FailedPackages = @(); ResolvedPackageIds = @(); ReviewPackages = @(); PostBootPackages = @(); PendingRestartCount = 0 } }
 
   try {
     $pendingState = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -753,8 +754,16 @@ function Resolve-PendingRestartVerification {
       Write-AgentEvent -EventId 5300 -EntryType Warning -Fields @{ packageId = [string]$entry.id; status = 'DeferredRestartVerificationPendingReboot'; restartRequired = $true; evidencePath = [string]$entry.evidencePath } | Out-Null
       continue
     }
-    $targetSatisfied = Test-RecordedTargetInstalled -Package $entry -AvailablePackages $AvailablePackages
-    $offers = @($AvailablePackages | Where-Object { $_.Id -eq $entry.id -and $_.Source -eq $entry.source })
+    $postBoot.Add($entry)
+    $dotNetProof = Get-DotNetRestartTargetProof -Package $entry
+    $offers = @()
+    if ($null -ne $dotNetProof) {
+      # A WinGet row or an ARP MSI version can describe a different .NET architecture or component.
+      $targetSatisfied = $dotNetProof.Verified
+    } else {
+      $targetSatisfied = Test-RecordedTargetInstalled -Package $entry -AvailablePackages $AvailablePackages
+      $offers = @($AvailablePackages | Where-Object { $_.Id -eq $entry.id -and $_.Source -eq $entry.source })
+    }
     if (-not $targetSatisfied -and $offers.Count -eq 1 -and (Get-PropertyValue $offers[0] 'InstallScope' '') -eq $Mode -and (Compare-RecordedPackageVersion $entry.id $offers[0].Installed $entry.available) -eq -1) {
       $failedPackage = $offers[0]
       $failed.Add($failedPackage)
@@ -762,7 +771,14 @@ function Resolve-PendingRestartVerification {
       Write-AgentEvent -EventId 5400 -EntryType Error -Fields @{ packageId = [string]$entry.id; status = 'RestartVerificationFailedStillOffered'; evidencePath = [string]$entry.evidencePath } | Out-Null
     } elseif ($targetSatisfied) {
       $resolved.Add([string]$entry.id)
-      Write-AgentEvent -EventId 5100 -EntryType Information -Fields @{ packageId = [string]$entry.id; status = 'RestartVerificationResolved'; evidencePath = [string]$entry.evidencePath } | Out-Null
+      $fields = @{ packageId = [string]$entry.id; status = 'RestartVerificationResolved'; evidencePath = [string]$entry.evidencePath }
+      if ($null -ne $dotNetProof) {
+        $fields.verificationMethod = 'DotNetMachineRegistrationAndPayload'
+        $fields.installed = [string]$entry.available
+        $fields.architecture = $dotNetProof.Architecture
+        $fields.verificationPath = $dotNetProof.Path
+      }
+      Write-AgentEvent -EventId 5100 -EntryType Information -Fields $fields | Out-Null
     } else {
       [void]$deferred.Add([string]$entry.id)
       $remaining.Add($entry)
@@ -780,8 +796,62 @@ function Resolve-PendingRestartVerification {
     FailedPackages     = @($failed | ForEach-Object { $_ })
     ResolvedPackageIds  = @($resolved | ForEach-Object { $_ })
     ReviewPackages      = $review.ToArray()
+    PostBootPackages    = $postBoot.ToArray()
     PendingRestartCount = $remaining.Count
   }
+}
+
+function Get-RegisteredDotNetInstallRoot {
+  param([string]$Architecture, [string]$VersionKey, [string]$Version)
+  $base = $null; $architectureKey = $null; $productKey = $null
+  try {
+    # The .NET host reads the machine-wide registration from the 32-bit registry view.
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry32')
+    $architectureKey = $base.OpenSubKey("SOFTWARE\dotnet\Setup\InstalledVersions\$Architecture")
+    if (-not $architectureKey) { return }
+    $productKey = $architectureKey.OpenSubKey($VersionKey)
+    if ($productKey -and $productKey.GetValue($Version, 0) -eq 1 -and $productKey.GetValueKind($Version) -eq 'DWord') {
+      return $architectureKey.GetValue('InstallLocation')
+    }
+  } catch {
+    return
+  } finally {
+    if ($productKey) { $productKey.Dispose() }
+    if ($architectureKey) { $architectureKey.Dispose() }
+    if ($base) { $base.Dispose() }
+  }
+}
+
+function Get-DotNetRestartTargetProof {
+  param([object]$Package)
+  if ($Mode -ne 'Machine' -or $Package.source -ne 'winget' -or
+    $Package.id -notmatch '^Microsoft\.DotNet\.(SDK|Runtime|AspNetCore|DesktopRuntime)\.([0-9]+)$') { return }
+  $family = $Matches[1]
+  $major = $Matches[2]
+  $result = [pscustomobject]@{ Verified = $false; Architecture = $null; Path = $null }
+  $version = [string]$Package.available
+  if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$' -or ($version.Split('.')[0] -ne $major) -or
+    $Package.name -notmatch '\((x64|x86|arm64)\)$') { return $result }
+  $result.Architecture = $Matches[1].ToLowerInvariant()
+  $framework, $binary = switch ($family) {
+    'SDK'            { 'sdk'; 'dotnet.dll' }
+    'Runtime'        { 'Microsoft.NETCore.App'; 'coreclr.dll' }
+    'AspNetCore'     { 'Microsoft.AspNetCore.App'; 'Microsoft.AspNetCore.dll' }
+    'DesktopRuntime' { 'Microsoft.WindowsDesktop.App'; 'PresentationFramework.dll' }
+  }
+  $registryPath = if ($family -eq 'SDK') { 'sdk' } else { "sharedfx\$framework" }
+  $productPath = if ($family -eq 'SDK') { 'sdk' } else { "shared\$framework" }
+  try {
+    $root = Get-RegisteredDotNetInstallRoot -Architecture $result.Architecture -VersionKey $registryPath -Version $version
+    if ($root -notmatch '^[a-z]:[\\/]') { return $result }
+    $payload = Join-Path (Join-Path (Join-Path $root $productPath) $version) $binary
+    if ((Test-Path -LiteralPath (Join-Path $root 'dotnet.exe') -PathType Leaf -ErrorAction Stop) -and
+      (Test-Path -LiteralPath $payload -PathType Leaf -ErrorAction Stop)) {
+      $result.Verified = $true
+      $result.Path = $payload
+    }
+  } catch { return $result }
+  return $result
 }
 
 function Compare-RecordedPackageVersion {
@@ -823,7 +893,7 @@ function Test-RecordedTargetInstalled {
 }
 
 function Resolve-RecordedPackageState {
-  param([object[]]$AvailablePackages, [string[]]$ResolvedRestartIds, [object[]]$ReviewRestartPackages, [object[]]$ApplicationRestartPackages)
+  param([object[]]$AvailablePackages, [object[]]$PostBootRestartPackages, [object[]]$ApplicationRestartPackages)
   if ($WhatIfPreference) { return }
   $script:CachedUninstallEntries = $null
   $script:CachedUserAppxPackages = $null
@@ -837,8 +907,8 @@ function Resolve-RecordedPackageState {
         if (-not @($ApplicationRestartPackages | Where-Object { Test-SameRecordedTarget $entry $_ }).Count -and -not (Test-RecordedTargetInstalled -Package $entry -AvailablePackages $AvailablePackages)) { $entry }
       })
       $restart = @(foreach ($entry in $previousRestart) {
-        # After a reboot, an inconclusive target is administrator evidence, not another reboot request.
-        if ($entry.id -notin $ResolvedRestartIds -and -not @($ReviewRestartPackages | Where-Object { Test-SameRecordedTarget $entry $_ }).Count) { $entry }
+        # A later boot retires only the matching reboot notice; unresolved targets stay in admin state.
+        if (-not @($PostBootRestartPackages | Where-Object { Test-SameRecordedTarget $entry $_ }).Count) { $entry }
       })
       if ($failed.Count -ne $previousFailed.Count -or $restart.Count -ne $previousRestart.Count) {
         $state.failedPackages = $failed
@@ -2293,9 +2363,8 @@ try {
   Write-WingetInventorySnapshot -Packages $availablePackages
   $restartVerification = Resolve-PendingRestartVerification -AvailablePackages $availablePackages
   $reviewRestart = @($restartVerification.ReviewPackages)
-  $resolvedRestartIds = @(@($restartVerification.ResolvedPackageIds) + @($restartVerification.FailedPackages | ForEach-Object { $_.Id }))
   $applicationRestart = @(Resolve-PendingApplicationRestart -AvailablePackages $availablePackages)
-  Resolve-RecordedPackageState -AvailablePackages $availablePackages -ResolvedRestartIds $resolvedRestartIds -ReviewRestartPackages $reviewRestart -ApplicationRestartPackages $applicationRestart
+  Resolve-RecordedPackageState -AvailablePackages $availablePackages -PostBootRestartPackages $restartVerification.PostBootPackages -ApplicationRestartPackages $applicationRestart
   $selectedPackages = @(Select-PolicyPackages -Packages $availablePackages -DeferredPackageIds $restartVerification.DeferredPackageIds -ApplicationRestartPackages $applicationRestart)
 
   $summary = @{
@@ -2329,7 +2398,7 @@ try {
   }
   if ($newApplicationRestart) {
     $applicationRestart = @(Get-ApplicationRestartState)
-    Resolve-RecordedPackageState -AvailablePackages $availablePackages -ResolvedRestartIds $resolvedRestartIds -ReviewRestartPackages $reviewRestart -ApplicationRestartPackages $applicationRestart
+    Resolve-RecordedPackageState -AvailablePackages $availablePackages -PostBootRestartPackages $restartVerification.PostBootPackages -ApplicationRestartPackages $applicationRestart
   }
 
   $rebootRequired = $summary.RestartRequired + $restartVerification.PendingRestartCount -gt $reviewRestart.Count

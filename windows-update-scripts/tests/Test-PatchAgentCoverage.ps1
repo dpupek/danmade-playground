@@ -333,7 +333,7 @@ $other = [pscustomobject]@{id='Test.Unrelated';source='winget';available='2.0.0'
 $review = Resolve-PendingRestartVerification @()
 Assert-Equal $review.ReviewPackages.Count 1 'Zoom should require post-reboot review.'
 # Act.
-Resolve-RecordedPackageState -AvailablePackages @() -ReviewRestartPackages $review.ReviewPackages
+Resolve-RecordedPackageState -AvailablePackages @() -PostBootRestartPackages $review.PostBootPackages
 # Assert.
 $notice = Get-Content -LiteralPath $noticePath -Raw | ConvertFrom-Json
 Assert-Equal $notice.restartRequiredPackages.Count 1 'Only the exact post-reboot notice should be removed.'
@@ -426,6 +426,142 @@ foreach ($case in @(
     Assert-Equal $failure.lastTaskResult $case.Result 'Preserve scheduler result.'
     Assert-Equal $failure.response 'ReportOnlyNoTermination' 'Health may only report.'
   }
+  $count++
+}
+# Mock only the machine registration read; the candidate checks the actual fixture files.
+function Get-RegisteredDotNetInstallRoot {
+  param($Architecture, $VersionKey, $Version)
+  $script:RegistrationReads++
+  if ($Architecture -eq $script:RegistrationArchitecture -and $VersionKey -eq $script:RegistrationKey -and $Version -eq $script:RegistrationVersion) { return $script:RegistrationRoot }
+}
+$Mode = 'Machine'
+$script:Events = New-Object 'System.Collections.Generic.List[object]'
+$dotNetProducts = @(
+  @{Id='SDK.8';Key='sdk';Dir='sdk';File='dotnet.dll';Version='8.0.428';Name='Microsoft .NET SDK 8.0.427 (x64)'},
+  @{Id='Runtime.10';Key='sharedfx\Microsoft.NETCore.App';Dir='shared\Microsoft.NETCore.App';File='coreclr.dll';Version='10.0.15';Name='Microsoft .NET Runtime - 10.0.14 (x64)'},
+  @{Id='AspNetCore.8';Key='sharedfx\Microsoft.AspNetCore.App';Dir='shared\Microsoft.AspNetCore.App';File='Microsoft.AspNetCore.dll';Version='8.0.34';Name='Microsoft ASP.NET Core 8.0.33 - Shared Framework (x64)'},
+  @{Id='DesktopRuntime.8';Key='sharedfx\Microsoft.WindowsDesktop.App';Dir='shared\Microsoft.WindowsDesktop.App';File='PresentationFramework.dll';Version='8.0.34';Name='Microsoft Windows Desktop Runtime - 8.0.33 (x64)'}
+)
+foreach ($product in $dotNetProducts) {
+  # Arrange / Initial Assert.
+  $script:RegistrationRoot = Join-Path $scratch $product.Id
+  $script:RegistrationArchitecture = 'x64'; $script:RegistrationKey = $product.Key; $script:RegistrationVersion = $product.Version
+  $script:RegistrationReads = 0
+  $versionPath = Join-Path (Join-Path $script:RegistrationRoot $product.Dir) $product.Version
+  $null = New-Item -ItemType Directory -Path $versionPath -Force
+  $binaryPath = Join-Path $versionPath $product.File
+  $null = New-Item -ItemType File -Path (Join-Path $script:RegistrationRoot 'dotnet.exe'),$binaryPath
+  $dotNetRecord = [pscustomobject]@{id="Microsoft.DotNet.$($product.Id)";name=$product.Name;available=$product.Version;source='winget';bootTimeAtDetection='2026-11-01';evidencePath='dotnet-fixture'}
+  Assert-Equal (Test-Path -LiteralPath $binaryPath -PathType Leaf) $true 'Exact fixture payload required.'
+  # Act.
+  $proof = Get-DotNetRestartTargetProof $dotNetRecord
+  # Assert.
+  Assert-Equal $proof.Verified $true "Exact machine proof missing for $($product.Id)."
+  Assert-Equal $proof.Path $binaryPath 'Proof must identify the checked binary.'
+  Assert-Equal $script:RegistrationReads 1 'Only the exact architecture/product/version key may be queried.'
+  $count++
+}
+
+$product = $dotNetProducts | Where-Object Id -eq 'DesktopRuntime.8'
+$desktopRoot = Join-Path $scratch $product.Id
+$versionPath = Join-Path (Join-Path $desktopRoot $product.Dir) $product.Version
+$binaryPath = Join-Path $versionPath $product.File
+$dotNetRecord = [pscustomobject]@{id='Microsoft.DotNet.DesktopRuntime.8';name=$product.Name;available=$product.Version;source='winget';bootTimeAtDetection='2026-11-01';evidencePath='dotnet-fixture'}
+$emptyRoot = Join-Path $scratch 'empty-runtime'
+$null = New-Item -ItemType Directory -Path $emptyRoot
+$null = New-Item -ItemType File -Path (Join-Path $emptyRoot 'dotnet.exe')
+foreach ($case in @(
+  @{Name='different architecture registration';Arch='x86';Key=$product.Key;Version=$product.Version;Leaf=$binaryPath;ExpectedReads=1},
+  @{Name='different product registration';Arch='x64';Key='sharedfx\Microsoft.NETCore.App';Version=$product.Version;Leaf=$binaryPath;ExpectedReads=1},
+  @{Name='neighboring version registration';Arch='x64';Key=$product.Key;Version='8.0.35';Leaf=$binaryPath;ExpectedReads=1},
+  @{Name='missing product binary';Arch='x64';Key=$product.Key;Version=$product.Version;Leaf=(Join-Path $versionPath 'absent.dll');Missing=$true;ExpectedReads=1},
+  @{Name='missing architecture in recorded name';Arch='x64';Key=$product.Key;Version=$product.Version;Leaf=$binaryPath;MissingArchitecture=$true;ExpectedReads=0}
+)) {
+  # Arrange / Initial Assert.
+  $script:RegistrationArchitecture = $case.Arch; $script:RegistrationKey = $case.Key; $script:RegistrationVersion = $case.Version
+  $script:RegistrationRoot = if ($case['Missing']) { $emptyRoot } else { $desktopRoot }
+  $dotNetRecord.name = if ($case['MissingArchitecture']) { 'Microsoft Windows Desktop Runtime - 8.0.33' } else { $product.Name }
+  $script:RegistrationReads = 0
+  Assert-Equal (Test-Path -LiteralPath $case.Leaf) (-not $case['Missing']) 'Fixture must control payload presence.'
+  # Act.
+  $proof = Get-DotNetRestartTargetProof $dotNetRecord
+  # Assert.
+  Assert-Equal $proof.Verified $false $case.Name
+  Assert-Equal $script:RegistrationReads $case.ExpectedReads 'Only recognized target identities may reach registration.'
+  $count++
+}
+
+# Arrange: a reboot occurred and the exact .NET target is installed, while another target still needs a first reboot.
+$script:RegistrationRoot = Join-Path $scratch $product.Id
+$script:RegistrationArchitecture = 'x64'; $script:RegistrationKey = $product.Key; $script:RegistrationVersion = $product.Version
+$dotNetRecord.name = $product.Name
+$olderOffer = [pscustomobject]@{id=$dotNetRecord.id;source='winget';installed='8.0.33';available='8.0.35';InstallScope='Machine'}
+$firstReboot = [pscustomobject]@{id='Test.Pending';name='Pending';source='winget';available='2.0.0';bootTimeAtDetection='2026-11-04';evidencePath='pending-fixture'}
+@{packages=@($dotNetRecord,$firstReboot)} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath
+$script:Events.Clear()
+Assert-Equal @((Get-Content -LiteralPath $statePath -Raw|ConvertFrom-Json).packages).Count 2 'Expected two pending records.'
+# Act.
+$recheck = Resolve-PendingRestartVerification @($olderOffer)
+# Assert.
+Assert-Equal ($recheck.ResolvedPackageIds -join ',') $dotNetRecord.id 'Positive machine proof must win over stale inventory.'
+Assert-Equal $recheck.PendingRestartCount 1 'Genuine first-reboot record must survive.'
+Assert-Equal $recheck.ReviewPackages.Count 0 'The exact .NET target is not inconclusive.'
+Assert-Equal $script:Events[0].verificationMethod 'DotNetMachineRegistrationAndPayload' 'Resolution must explain its proof.'
+$count++
+
+# Arrange / Initial Assert: the notice also includes another version with the same ID.
+$later = [pscustomobject]@{id=$dotNetRecord.id;source=$dotNetRecord.source;available='8.0.35'}
+@{status='CompletedRestartRequired';failedPackages=@();restartRequiredPackages=@($dotNetRecord,$firstReboot,$later);summary=@{failed=0;restartRequired=3}} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $noticePath
+Assert-Equal @((Get-Content -LiteralPath $noticePath -Raw|ConvertFrom-Json).restartRequiredPackages).Count 3 'Expected three distinct notices.'
+# Act.
+Resolve-RecordedPackageState -AvailablePackages @() -PostBootRestartPackages $recheck.PostBootPackages
+# Assert.
+$notices = @((Get-Content -LiteralPath $noticePath -Raw|ConvertFrom-Json).restartRequiredPackages)
+Assert-Equal ($notices.available -join ',') '2.0.0,8.0.35' 'Remove the exact resolved notice, not other versions or first reboots.'
+$count++
+
+# Arrange: no matching payload, even though WinGet reports a matching version without architecture.
+$script:RegistrationRoot = $emptyRoot
+$unqualifiedOffer = [pscustomobject]@{id=$dotNetRecord.id;source='winget';installed=$dotNetRecord.available;available='8.0.35';InstallScope='Machine'}
+@{packages=@($dotNetRecord)} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath
+Assert-Equal (Test-Path -LiteralPath $statePath) $true 'Unproven case must start pending.'
+# Act.
+$unproven = Resolve-PendingRestartVerification @($unqualifiedOffer)
+# Assert.
+Assert-Equal $unproven.ReviewPackages.Count 1 'Unproven target must still require administrator review.'
+Assert-Equal $unproven.ResolvedPackageIds.Count 0 'Unqualified WinGet version is not machine proof for .NET.'
+Assert-Equal (Test-Path -LiteralPath $statePath) $true 'Keep unproven target state.'
+$count++
+
+# Arrange: an exact target already on disk cannot waive a first reboot.
+$script:RegistrationRoot = $desktopRoot
+$dotNetRecord.bootTimeAtDetection = '2026-11-04'
+@{packages=@($dotNetRecord)} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $statePath
+Assert-Equal (Test-Path -LiteralPath $statePath) $true 'Pre-boot case must start pending.'
+$script:RegistrationReads = 0
+# Act.
+$beforeBoot = Resolve-PendingRestartVerification @()
+# Assert.
+Assert-Equal $beforeBoot.PendingRestartCount 1 'First reboot is still required.'
+Assert-Equal $beforeBoot.PostBootPackages.Count 0 'Do not retire the first reboot notice.'
+Assert-Equal $script:RegistrationReads 0 'Do not probe versions before the reboot gate.'
+$count++
+
+foreach ($case in @(
+  @{Id='Microsoft.DotNet.DesktopRuntime.8';Mode='User';Source='winget'},
+  @{Id='Microsoft.DotNet.HostingBundle.8';Mode='Machine';Source='winget'},
+  @{Id='Microsoft.DotNet.DesktopRuntime.8';Mode='Machine';Source='msstore'}
+)) {
+  # Arrange / Initial Assert.
+  $Mode = $case.Mode
+  $candidate = [pscustomobject]@{id=$case.Id;source=$case.Source;available=$product.Version;name=$product.Name}
+  $script:RegistrationReads = 0
+  Assert-Equal (Test-Path -LiteralPath $binaryPath) $true 'Matching runtime payload is deliberately present.'
+  # Act.
+  $proof = Get-DotNetRestartTargetProof $candidate
+  # Assert.
+  Assert-Equal ($null -eq $proof) $true 'Unsupported scope, product or source must not use machine registration proof.'
+  Assert-Equal $script:RegistrationReads 0 'Unsupported targets must not reach registry reads.'
   $count++
 }
 Write-Output "Passed $count coverage and installed-target regression scenarios. Artifacts: $scratch"

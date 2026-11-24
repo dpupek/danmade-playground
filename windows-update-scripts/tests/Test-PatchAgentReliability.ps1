@@ -104,7 +104,7 @@ $oldFailure = [pscustomobject]@{ id='Microsoft.Edge'; name='Edge'; available='15
 $oldRestart = [pscustomobject]@{ id='Test.Pending'; name='Pending'; available='1.1.0'; source='winget' }
 Write-NotificationState -Status CompletedWithFailures -Summary @{Failed=1;RestartRequired=1} -FailedPackages @($oldFailure) -RestartRequiredPackages @($oldRestart)
 Assert-Equal (Test-Path (Get-NotificationStatePath)) $true 'Mixed notification fixture must exist.'
-Resolve-RecordedPackageState -AvailablePackages @() -ResolvedRestartIds @()
+Resolve-RecordedPackageState -AvailablePackages @()
 Clear-NotificationState -PreserveRestartRequired
 $state = Get-Content (Get-NotificationStatePath) -Raw | ConvertFrom-Json
 Assert-Equal @($state.failedPackages).Count 0 'Externally resolved target must stop nagging.'
@@ -113,7 +113,7 @@ Write-NotificationState -Status CompletedWithFailures -Summary @{Failed=1} -Fail
 $state = Get-Content (Get-NotificationStatePath) -Raw | ConvertFrom-Json
 Assert-Equal @($state.restartRequiredPackages).Count 1 'New failure must retain an older reboot notice.'
 $count++
-Resolve-RecordedPackageState -AvailablePackages @() -ResolvedRestartIds @('Test.Pending')
+Resolve-RecordedPackageState -AvailablePackages @() -PostBootRestartPackages @($oldRestart)
 Assert-Equal (Test-Path (Get-NotificationStatePath)) $false 'Confirmed resolved targets should clear state.'
 $count++
 

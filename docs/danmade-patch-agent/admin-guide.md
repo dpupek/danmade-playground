@@ -1,6 +1,6 @@
 # Danmade Patch Agent Admin Guide
 
-Date: 2026-11-18
+Date: 2026-11-24
 
 Operator Level: Windows-first beginner operator (little Windows domain experience and no Linux experience)
 
@@ -492,6 +492,18 @@ EXE target comparison accepts `x.y.z (build)` and the equivalent `x.y.z.build`,
 but does not infer a missing build. A positively identified older version still offered after reboot
 remains `RestartVerificationFailedStillOffered`. Immediate post-install inventory
 verification remains separate and unchanged.
+
+For WinGet .NET SDK, .NET Runtime, ASP.NET Core and Windows Desktop Runtime
+packages in Machine mode, post-reboot proof requires the recorded architecture,
+the exact target registered in machine-wide .NET setup, and its product binary
+under the registered install root. The agent records
+`verificationMethod=DotNetMachineRegistrationAndPayload` on resolution. An
+older-version uninstall name, an MSI display version, a different architecture
+or a neighboring release does not prove the target. No dotnet command is run.
+Hosting Bundle verification does not use this check: a runtime can be installed
+without the hosting components. A real first reboot remains required; afterward,
+a verified target and its matching notice clear, and an unproven target remains
+for administrator review without another reboot request for that target.
 
 Optional `appxPackageFamilyNames` on a package rule is an array of exact family names
 including publisher IDs. Current-user healthy main registrations are queried
